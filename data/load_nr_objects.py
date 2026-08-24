@@ -182,7 +182,7 @@ class ClevrDatasetImagesAndDescriptions(Dataset):
         return image, labels
 
 def load_nr_objects(args):
-    CONCAT_LABELS = False
+    CONCAT_LABELS = True
 
     clevr_dir = args.dataset_path #"C:\\Users\\zhicong\\Documents\\Data\\enrc_data\\enrc_data\\nr_objects"
     # args.dataset_path = clevr_dir
