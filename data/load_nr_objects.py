@@ -184,9 +184,9 @@ class ClevrDatasetImagesAndDescriptions(Dataset):
 def load_nr_objects(args):
     CONCAT_LABELS = False
 
-    clevr_dir = "C:\\Users\\zhicong\\Documents\\Data\\enrc_data\\enrc_data\\nr_objects"
-    args.dataset_path = clevr_dir
-    nr_of_images = 100 #10000
+    clevr_dir = args.dataset_path #"C:\\Users\\zhicong\\Documents\\Data\\enrc_data\\enrc_data\\nr_objects"
+    # args.dataset_path = clevr_dir
+    nr_of_images = 10000
     if CONCAT_LABELS:
         concat_json = generate_scenes(os.path.join(
             clevr_dir, "scenes"), nr_of_images=nr_of_images)
