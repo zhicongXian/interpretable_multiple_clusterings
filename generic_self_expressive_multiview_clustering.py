@@ -279,13 +279,13 @@ class LossWeightsForAugmentation:
     cluster_structure: float = 0.1
     coefficient_entropy: float = 0.002
     stability: float = 0.05
-    augmentation_consistency: float = 0.1#0.05
-    independence: float = 0.06#0.02 # 0.02
+    augmentation_consistency: float = 0.0 # 0.1#0.05
+    independence: float = 0.06 #0.02 # 0.02
     projection_orthogonality: float = 0.1
     projection_overlap: float = 0.005 # 0.05
     beta_entropy: float = 0.01
     beta_mass_balance: float = 0.2
-    beta_effective_dimension: float = 0.05
+    beta_effective_dimension: float = 0.0 #0.05
     latent_variance: float = 0.05
     worst_view_temperature: float = 0.1
     embedding_diversity: float = 0.0 # 0.00002
@@ -298,8 +298,8 @@ class LossWeights:
     independence: float = 0.05
     projection_overlap: float = 0.02
     beta_entropy: float = 0.01
-    beta_mass_balance: float = 0.2
-    beta_effective_dimension: float = 0.05
+    beta_mass_balance: float = 0.0 #0.2
+    beta_effective_dimension: float = 0.0 #0.05
     latent_variance: float = 0.05
     worst_view_temperature: float = 0.1
     embedding_diversity: float = 0.0 # 0.00002
@@ -1318,9 +1318,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--view-epochs", type=int, default=300)
     parser.add_argument("--joint-epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--pretrain-learning-rate", type=float, default=2e-3)
-    parser.add_argument("--view-learning-rate", type=float, default=1e-3)
-    parser.add_argument("--joint-learning-rate", type=float, default=3e-4)
+    parser.add_argument("--pretrain-learning-rate", type=float, default=1e-4)
+    parser.add_argument("--view-learning-rate", type=float, default=1e-4)
+    parser.add_argument("--joint-learning-rate", type=float, default=1e-4)
     parser.add_argument("--noise-std", type=float, default=0.01)
     parser.add_argument("--tensorboard-log-dir", type=Path, default=None)
     parser.add_argument("--max-train-samples", type=int, default=None)

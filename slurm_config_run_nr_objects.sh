@@ -21,9 +21,9 @@ export LAPACK=/usr/lib/x86_64-linux-gnu/lapack/liblapack.a
 # pip install -U pip setuptools wheel
 # train
 python3 ./generic_self_expressive_multiview_clustering.py --clusters=6,2,3 \
---pretrain-epochs=300 \
+--pretrain-epochs=1000 \
 --joint-epochs=1000 \
---view-epochs=300 \
+--view-epochs=1000 \
 --checkpoint=./outputs/nr_objects.pt \
 --visualization=./outputs/nr_objects.html \
 --dataset=nr_objects \
