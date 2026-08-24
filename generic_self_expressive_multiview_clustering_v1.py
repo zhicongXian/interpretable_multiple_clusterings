@@ -145,6 +145,7 @@ class SemiOrthogonalProjectionHead(nn.Module):
         else:
             return F.linear(weighted, self.weight_raw)
 
+
 class GenericSelfExpressiveMultiView(nn.Module):
     """Shared nonlinear representation with learned generic latent views."""
 
@@ -218,18 +219,26 @@ class GenericSelfExpressiveMultiView(nn.Module):
             ]
         )
 
-    def rotation(self) -> Tensor:
-        basis, triangular = torch.linalg.qr(self.rotation_raw)
-        signs = torch.sign(torch.diagonal(triangular)).detach()
-        signs = torch.where(signs == 0, torch.ones_like(signs), signs)
-        return basis * signs.unsqueeze(0) # this only creates rotation basis
+    def rotation(self, z) -> tuple[Tensor, Tensor, Tensor]:
+
+        z_rot = torch.matmul(z, self.rotation_raw)
+
+        z_detached_rot = torch.matmul(z.detach(), self.rotation_raw)
+        z_detached_rot_back = torch.matmul(z_detached_rot, self.rotation_raw.t())
+        loss = self.rotation_layer_loss(z.detach(), z_detached_rot_back)
+
+        # basis, triangular = torch.linalg.qr(self.rotation_raw)
+        # signs = torch.sign(torch.diagonal(triangular)).detach()
+        # signs = torch.where(signs == 0, torch.ones_like(signs), signs)
+        # return basis * signs.unsqueeze(0)
+        return z_rot, z_detached_rot, loss
 
     def beta(self) -> Tensor:
         return torch.softmax(self.beta_logits, dim=0)
 
     def encode_rotated(self, images: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         shared = self.encoder(images)
-        rotation = self.rotation()
+        rotation, detach_rotation, loss = self.rotation(shared)
         return shared, shared @ rotation, rotation
 
     def project_views(
@@ -897,7 +906,7 @@ def train_phase(
                 if augmentation_roles is None:
                     left = (images + noise_std * torch.randn_like(images)).clamp(0, 1)
                     right = (images + noise_std * torch.randn_like(images)).clamp(0, 1)
-                    augmented = None #(model(left), model(right))
+                    augmented = (model(left), model(right))
                 else:
                     augmented = view_specific_augmented_outputs(
                         model,
