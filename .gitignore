@@ -1,2 +1,4 @@
 outputs/
 data/datasets/
+data/__pycache__/
+utils/__pycache__/

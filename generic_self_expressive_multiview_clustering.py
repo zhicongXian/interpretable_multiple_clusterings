@@ -47,6 +47,7 @@ from loss.utils import (beta_effective_dimension_loss, beta_mass_balance_loss,
                         beta_entropy, normalized_linear_hsic,
                         smooth_worst_view, semi_orthogonal_overlap_loss)
 from data.load_nr_objects import load_nr_objects
+from data.load_stickfigures import load_stickfigures
 from utils.general_utils import set_seed
 
 def _integer_tuple(text: str) -> tuple[int, ...]:
@@ -1087,6 +1088,8 @@ def evaluate_clustering(
         labels = [np.asarray(archive[key])[original_indices] for key in label_keys]
     elif args.dataset.lower() == "nr_objects":
         facets=["color", "material", "shape"] # material_objects_colors, i need to get the label information
+    elif args.dataset.lower() == "stickfigures":
+        facets=["upper", "lower"]
 
     predictions=np.asarray(predictions)
     labels=np.asarray(labels)
@@ -1369,7 +1372,7 @@ def get_dataloaders_for_synthetic_shape_color(args):
     return train_loader, test_loader
 
 def run(args: argparse.Namespace) -> None:
-    datasets_list = ["synthetic_shape_color", "nr_objects"]
+    datasets_list = ["synthetic_shape_color", "nr_objects", "stickfigures"]
     assert args.dataset.lower() in datasets_list, "Only {} are supported".format(','.join(datasets_list))
     same_seeds(args.seed)
     if min(args.pretrain_epochs, args.view_epochs, args.joint_epochs) < 0:
@@ -1382,6 +1385,8 @@ def run(args: argparse.Namespace) -> None:
     elif args.dataset.lower() == "nr_objects":
         # here comes the nr-objects loading
         train_loader, test_loader = load_nr_objects(args)
+    elif args.dataset.lower() == "stickfigures":
+        train_loader, test_loader = load_stickfigures(args)
     else:
         raise ValueError("dataset must be either 'synthetic' or 'nr_objects'.")
 
