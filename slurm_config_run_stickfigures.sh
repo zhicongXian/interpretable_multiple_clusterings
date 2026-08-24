@@ -27,5 +27,6 @@ python3 ./generic_self_expressive_multiview_clustering.py --clusters=3,3 \
 --checkpoint=./outputs/stickfigures.pt \
 --visualization=./outputs/stickfigures.html \
 --dataset=stickfigures \
+--tensorboard-log-dir=./outputs/ \
 --dataset-path=data/datasets/enrc_data/stickfigures >> ./outputs/deep_imc_stickfigures_out.txt
 
