@@ -1368,7 +1368,7 @@ def visualize_views(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=str, required=True)
-    parser.add_argument("--dataset-path", type=Path, default=Path("shape_color_multiview_dataset.npz"))
+    parser.add_argument("--dataset-path", type=Path, required=True)#default=Path("shape_color_multiview_dataset.npz"))
     parser.add_argument("--clusters", type=_integer_tuple, required=True)
     parser.add_argument("--view-names", type=_string_tuple, default=None)
     parser.add_argument("--latent-dim", type=int, default=64)
