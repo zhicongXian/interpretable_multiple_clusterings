@@ -1152,7 +1152,7 @@ def evaluate_clustering(
 
     output_file = f"./outputs/{args.dataset}_clustering_results.txt"
 
-    with open(output_file, "w", encoding="utf-8") as file:
+    with open(output_file, "a+", encoding="utf-8") as file:
         print("\nOptimal one-to-one correspondence (evaluation only):", file=file)
 
         for match in matches:
@@ -1435,7 +1435,7 @@ def run(args: argparse.Namespace) -> None:
             train_idx.append(indices.detach().cpu().numpy())
         train_x = np.concatenate(train_x)
         train_idx = np.concatenate(train_idx)
-        np.savez("outputs/pretrain_embedding_train_data.npz", train_x=train_x, train_idx=train_idx)
+        np.savez(f"outputs/{args.dataset}_pretrain_embedding_train_data.npz", train_x=train_x, train_idx=train_idx)
 
         test_x = []
         test_idx = []
@@ -1446,7 +1446,7 @@ def run(args: argparse.Namespace) -> None:
             test_idx.append(indices.detach().cpu().numpy())
         test_x = np.concatenate(test_x)
         test_idx = np.concatenate(test_idx)
-        np.savez("outputs/pretrain_embedding_test_data.npz", test_x=test_x, test_idx=test_idx)
+        np.savez(f"outputs/{args.dataset}_pretrain_embedding_test_data.npz", test_x=test_x, test_idx=test_idx)
 
 
 

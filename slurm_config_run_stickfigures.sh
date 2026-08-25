@@ -27,6 +27,8 @@ python3 ./generic_self_expressive_multiview_clustering_senet_style.py --clusters
 --checkpoint=./outputs/stickfigures_senet.pt \
 --visualization=./outputs/stickfigures_senet.html \
 --dataset=stickfigures \
+--augmentation-roles=upper,lower\
+--upper-lower-mask-strength 1.0 \
 --tensorboard-log-dir=./outputs/runs_stickfigures/ \
 --dataset-path=data/datasets/enrc_data/stickfigures >> ./outputs/deep_imc_stickfigures_out.txt
 

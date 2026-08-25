@@ -816,6 +816,40 @@ def _shuffle_space_preserve_color(images: Tensor, strength: float) -> Tensor:
     shuffled = flattened.gather(2, gather_indices).view_as(images)
     return (1.0 - strength) * images + strength * shuffled
 
+
+def _mask_vertical_region(
+    images: Tensor,
+    region: str,
+    *,
+    split_fraction: float,
+    strength: float,
+) -> Tensor:
+    """Mask the upper or lower image region with the zero/background value.
+
+    ``split_fraction`` is the boundary measured from the top of the image.
+    ``strength=1`` completely removes the selected region, while smaller
+    values blend the original pixels with the masked image.
+    """
+
+    if region not in {"upper", "lower"}:
+        raise ValueError("region must be either 'upper' or 'lower'.")
+    if not 0.0 < split_fraction < 1.0:
+        raise ValueError("split_fraction must lie strictly between 0 and 1.")
+    if not 0.0 <= strength <= 1.0:
+        raise ValueError("mask strength must lie in [0, 1].")
+    if images.ndim != 4 or images.shape[-2] < 2:
+        raise ValueError("images must have shape [N, C, H, W] with H >= 2.")
+
+    height = images.shape[-2]
+    split_row = min(max(int(round(height * split_fraction)), 1), height - 1)
+    keep_mask = images.new_ones((1, 1, height, 1))
+    if region == "upper":
+        keep_mask[..., :split_row, :] = 0.0
+    else:
+        keep_mask[..., split_row:, :] = 0.0
+    masked = images * keep_mask
+    return (1.0 - strength) * images + strength * masked
+
 def augment_for_view(
     images: Tensor,
     role: str,
@@ -823,17 +857,41 @@ def augment_for_view(
     noise_std: float,
     shape_recolor_strength: float,
     color_shuffle_strength: float,
+    upper_lower_mask_split: float = 0.5,
+    upper_lower_mask_strength: float = 1.0,
 ) -> Tensor:
-    """Create an augmentation that removes nuisance information for one view."""
+    """Create an augmentation that removes nuisance information for one view.
 
-    augmented = _mild_spatial_augmentation(images)
+    The role names describe the content that should be preserved. Therefore,
+    ``upper`` masks the lower region and ``lower`` masks the upper region.
+    """
+
+
     if role == "shape": # --TODO is the way to do data augmentation correct?
+        augmented = _mild_spatial_augmentation(images)
         augmented = _randomize_color_preserve_shape(
             augmented, shape_recolor_strength
         )
     elif role == "color":
+        augmented = _mild_spatial_augmentation(images)
         augmented = _shuffle_space_preserve_color(
             augmented, color_shuffle_strength
+        )
+    elif role == "upper":
+        augmented = images
+        augmented = _mask_vertical_region(
+            augmented,
+            "lower",
+            split_fraction=upper_lower_mask_split,
+            strength=upper_lower_mask_strength,
+        )
+    elif role == "lower":
+        augmented = images
+        augmented = _mask_vertical_region(
+            augmented,
+            "upper",
+            split_fraction=upper_lower_mask_split,
+            strength=upper_lower_mask_strength,
         )
     elif role != "generic":
         raise ValueError(f"Unknown augmentation role: {role}")
@@ -850,9 +908,13 @@ def view_specific_augmented_outputs(
     noise_std: float,
     shape_recolor_strength: float,
     color_shuffle_strength: float,
+    upper_lower_mask_split: float = 0.5,
+    upper_lower_mask_strength: float = 1.0,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Efficiently extract matching view outputs from semantic augmentations."""
 
+    if len(roles) != model.n_views:
+        raise ValueError("Provide exactly one augmentation role for every view.")
     batch_size = images.shape[0]
     augmented_batches = [
         augment_for_view(
@@ -861,6 +923,8 @@ def view_specific_augmented_outputs(
             noise_std=noise_std,
             shape_recolor_strength=shape_recolor_strength,
             color_shuffle_strength=color_shuffle_strength,
+            upper_lower_mask_split=upper_lower_mask_split,
+            upper_lower_mask_strength=upper_lower_mask_strength,
         )
         for _ in range(2)
         for role in roles
@@ -1077,8 +1141,9 @@ def train_phase(
     augmentation_roles=None,
     shape_recolor_strength = 0.6,
     color_shuffle_strength = 0.6,
-        eigengap_margin: float = 0.1,
-
+    upper_lower_mask_split: float = 0.5,
+    upper_lower_mask_strength: float = 1.0,
+    eigengap_margin: float = 0.1,
 ) -> list[dict[str, float]]:
     _configure_phase(model, phase)
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
@@ -1114,6 +1179,8 @@ def train_phase(
                         noise_std=noise_std,
                         shape_recolor_strength=shape_recolor_strength,
                         color_shuffle_strength=color_shuffle_strength,
+                        upper_lower_mask_split=upper_lower_mask_split,
+                        upper_lower_mask_strength=upper_lower_mask_strength,
                     )
 
                 total, terms = multiview_loss_with_augmentation(
@@ -1556,6 +1623,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--view-learning-rate", type=float, default=1e-4)
     parser.add_argument("--joint-learning-rate", type=float, default=1e-4)
     parser.add_argument("--noise-std", type=float, default=0.01)
+    parser.add_argument(
+        "--upper-lower-mask-split",
+        type=float,
+        default=0.5,
+        help="Vertical upper/lower boundary as a fraction of image height.",
+    )
+    parser.add_argument(
+        "--upper-lower-mask-strength",
+        type=float,
+        default=1.0,
+        help="Strength of upper/lower masking in [0, 1].",
+    )
     parser.add_argument("--tensorboard-log-dir", type=Path, default=None)
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-test-samples", type=int, default=None)
@@ -1579,7 +1658,9 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Comma-separated semantic content preserved by each view. "
-            "For the shape-color dataset use: shape,color."
+            "Use shape,color for the shape-color dataset or upper,lower "
+            "for stick figures. The upper role masks the lower image region, "
+            "and the lower role masks the upper region."
         ),
     )
     return parser.parse_args()
@@ -1615,6 +1696,22 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("Epoch counts must be nonnegative.")
     if args.view_names is not None and len(args.view_names) != len(args.clusters):
         raise ValueError("view-names and clusters must have the same length.")
+    if not 0.0 < args.upper_lower_mask_split < 1.0:
+        raise ValueError("upper-lower-mask-split must lie strictly between 0 and 1.")
+    if not 0.0 <= args.upper_lower_mask_strength <= 1.0:
+        raise ValueError("upper-lower-mask-strength must lie in [0, 1].")
+    if args.dataset.lower() == "stickfigures" and args.augmentation_roles is None:
+        if len(args.clusters) != 2:
+            raise ValueError(
+                "Automatic stick-figure augmentation requires exactly two views. "
+                "Otherwise provide --augmentation-roles explicitly."
+            )
+        args.augmentation_roles = ("upper", "lower")
+    if (
+        args.augmentation_roles is not None
+        and len(args.augmentation_roles) != len(args.clusters)
+    ):
+        raise ValueError("Provide exactly one augmentation role for every view.")
     set_seed(args.seed)
     if args.dataset.lower() == "synthetic_shape_color":
         train_loader, test_loader = get_dataloaders_for_synthetic_shape_color(args)
@@ -1713,6 +1810,8 @@ def run(args: argparse.Namespace) -> None:
             weights=weights,
             writer=writer,
             augmentation_roles=args.augmentation_roles,
+            upper_lower_mask_split=args.upper_lower_mask_split,
+            upper_lower_mask_strength=args.upper_lower_mask_strength,
             eigengap_margin=args.eigengap_margin,
         )
         print("evaluation after VIEW TRAINING")
@@ -1737,6 +1836,8 @@ def run(args: argparse.Namespace) -> None:
             weights=weights,
             writer=writer,
             augmentation_roles=args.augmentation_roles,
+            upper_lower_mask_split=args.upper_lower_mask_split,
+            upper_lower_mask_strength=args.upper_lower_mask_strength,
             eigengap_margin=args.eigengap_margin,
         )
         test_metrics = evaluate_clustering(
