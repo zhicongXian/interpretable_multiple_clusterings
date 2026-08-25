@@ -424,13 +424,13 @@ class GenericSelfExpressiveMultiView(nn.Module):
 class LossWeightsForAugmentation:
     # Reconstruction is already optimized during pretraining. A smaller joint
     # weight lets clustering reorganize the shared representation.
-    reconstruction: float = 0.25
+    reconstruction: float = 1.0
     self_expression: float = 0.2
     cluster_structure: float = 0.1
     coefficient_regularization: float = 0.002
     stability: float = 0.05
-    augmentation_consistency: float = 0.0 # 0.1#0.05
-    independence: float = 0.06 #0.02 # 0.02
+    augmentation_consistency: float = 0.2 # 0.1#0.05
+    independence: float = 0.02 #0.02 # 0.02
     projection_orthogonality: float = 0.1
     projection_overlap: float = 0.005 # 0.05
     beta_entropy: float = 0.01
@@ -439,7 +439,7 @@ class LossWeightsForAugmentation:
     latent_variance: float = 0.05
     worst_view_temperature: float = 0.1
     embedding_diversity: float = 0.0 # 0.00002
-    spectral_separation: float = 0.2
+    spectral_separation: float = 0.0 #  0.2
 @dataclass # (frozen=True)
 class LossWeights:
     reconstruction: float = 1.0
