@@ -27,6 +27,6 @@ python3 ./generic_self_expressive_multiview_clustering_v1.py --clusters=6,2,3 \
 --checkpoint=./outputs/nr_objects_v1.pt \
 --visualization=./outputs/nr_objects_v1.html \
 --dataset=nr_objects \
---tensorboard-log-dir=./outputs/runs_nr_objects/ \
+--tensorboard-log-dir=./outputs/runs_nr_objects \
 --dataset-path=data/datasets/enrc_data/nr_objects >> ./outputs/deep_imc_nr_objects_out.txt
 
