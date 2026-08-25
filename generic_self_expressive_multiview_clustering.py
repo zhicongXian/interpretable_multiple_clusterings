@@ -546,7 +546,7 @@ def pretrain_autoencoder(
     noise_std: float,
     device: torch.device,
     writer: Any | None,
-    loss_weight = 0.002
+    loss_weight = 0.0 #0.002
 ) -> list[float]:
     parameters = itertools.chain(model.encoder.parameters(), model.decoder.parameters())
     optimizer = torch.optim.AdamW(parameters, lr=learning_rate, weight_decay=1e-4)
@@ -868,7 +868,7 @@ def train_phase(
     device: torch.device,
     weights: LossWeights,
     writer: Any | None,
-    augmentation_roles=("shape", "color"),
+    augmentation_roles=None,
     shape_recolor_strength = 0.6,
     color_shuffle_strength = 0.6,
 
@@ -897,7 +897,7 @@ def train_phase(
                 if augmentation_roles is None:
                     left = (images + noise_std * torch.randn_like(images)).clamp(0, 1)
                     right = (images + noise_std * torch.randn_like(images)).clamp(0, 1)
-                    augmented = None #(model(left), model(right))
+                    augmented = (model(left), model(right))
                 else:
                     augmented = view_specific_augmented_outputs(
                         model,
