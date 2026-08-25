@@ -1,3 +1,5 @@
+# In this v1 version, I will add the diversity regularization loss and minimizing normalized eigenmap
+
 r"""Generic deep self-expressive multiple-view clustering for images.
 
 This program contains no semantic view-specific preprocessing.  Every image is
@@ -145,7 +147,6 @@ class SemiOrthogonalProjectionHead(nn.Module):
         else:
             return F.linear(weighted, self.weight_raw)
 
-
 class GenericSelfExpressiveMultiView(nn.Module):
     """Shared nonlinear representation with learned generic latent views."""
 
@@ -219,26 +220,18 @@ class GenericSelfExpressiveMultiView(nn.Module):
             ]
         )
 
-    def rotation(self, z) -> tuple[Tensor, Tensor, Tensor]:
-
-        z_rot = torch.matmul(z, self.rotation_raw)
-
-        z_detached_rot = torch.matmul(z.detach(), self.rotation_raw)
-        z_detached_rot_back = torch.matmul(z_detached_rot, self.rotation_raw.t())
-        loss = self.rotation_layer_loss(z.detach(), z_detached_rot_back)
-
-        # basis, triangular = torch.linalg.qr(self.rotation_raw)
-        # signs = torch.sign(torch.diagonal(triangular)).detach()
-        # signs = torch.where(signs == 0, torch.ones_like(signs), signs)
-        # return basis * signs.unsqueeze(0)
-        return z_rot, z_detached_rot, loss
+    def rotation(self) -> Tensor:
+        basis, triangular = torch.linalg.qr(self.rotation_raw)
+        signs = torch.sign(torch.diagonal(triangular)).detach()
+        signs = torch.where(signs == 0, torch.ones_like(signs), signs)
+        return basis * signs.unsqueeze(0) # this only creates rotation basis
 
     def beta(self) -> Tensor:
         return torch.softmax(self.beta_logits, dim=0)
 
     def encode_rotated(self, images: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         shared = self.encoder(images)
-        rotation, detach_rotation, loss = self.rotation(shared)
+        rotation = self.rotation()
         return shared, shared @ rotation, rotation
 
     def project_views(
@@ -298,6 +291,7 @@ class LossWeightsForAugmentation:
     latent_variance: float = 0.05
     worst_view_temperature: float = 0.1
     embedding_diversity: float = 0.0 # 0.00002
+    spectral_separation: float = 0.2
 @dataclass # (frozen=True)
 class LossWeights:
     reconstruction: float = 1.0
@@ -555,7 +549,7 @@ def pretrain_autoencoder(
     noise_std: float,
     device: torch.device,
     writer: Any | None,
-    loss_weight = 0.002
+    loss_weight = 0.0 #0.002
 ) -> list[float]:
     parameters = itertools.chain(model.encoder.parameters(), model.decoder.parameters())
     optimizer = torch.optim.AdamW(parameters, lr=learning_rate, weight_decay=1e-4)
@@ -574,9 +568,9 @@ def pretrain_autoencoder(
             recon_loss = F.mse_loss(model.autoencode(corrupted), images)
             latent_image = model.encoder(images)
             latent_corrupted= model.encoder(corrupted)
-            mcr_loss_tensor = 0.5 * loss_weight * (total_coding_rate(latent_image, latent_image) + total_coding_rate(latent_corrupted,
+            mcr_loss_tensor = 0.5 * (total_coding_rate(latent_image, latent_image) + total_coding_rate(latent_corrupted,
                                                                                                    latent_corrupted))
-            loss = recon_loss + mcr_loss_tensor
+            loss = recon_loss +  loss_weight * mcr_loss_tensor
             loss.backward()
             optimizer.step()
             running += float(loss.detach()) * images.shape[0]
@@ -590,6 +584,7 @@ def pretrain_autoencoder(
               f"mcr_loss={mcr_loss}")
         if writer is not None:
             writer.add_scalar("pretrain/reconstruction", value, epoch)
+            writer.add_scalar("pretrain/mcr", mcr_loss, epoch)
     return history
 
 
@@ -764,6 +759,49 @@ def semi_orthogonality_loss(projection_weights: Sequence[Tensor]) -> Tensor:
         penalties.append(gram_error.square().mean())
     return torch.stack(penalties).mean()
 
+def spectral_cluster_separation_loss(
+    affinities: Sequence[Tensor],
+    n_clusters: Sequence[int],
+    *,
+    eigengap_margin: float,
+    worst_view_temperature: float,
+    eps: float = 1e-8,
+) -> Tensor:
+    """Encourage exactly ``K_v`` graph components in every view.
+
+    For the normalized Laplacian, the first ``K_v`` eigenvalues are pushed
+    towards zero, while eigenvalue ``K_v + 1`` is kept above a margin. Batches
+    with no ``K_v + 1`` eigenvalue are skipped for this term.
+    """
+
+    per_view: list[Tensor] = []
+    for affinity, cluster_count in zip(affinities, n_clusters):
+        sample_count = affinity.shape[0]
+        if sample_count <= cluster_count:
+            per_view.append(affinity.new_zeros(()))
+            continue
+
+        affinity = 0.5 * (affinity + affinity.transpose(0, 1))
+        degree = affinity.sum(dim=1).clamp_min(eps)
+        inverse_sqrt_degree = degree.rsqrt()
+        normalized_affinity = (
+            inverse_sqrt_degree[:, None]
+            * affinity
+            * inverse_sqrt_degree[None, :]
+        )
+        identity = torch.eye(
+            sample_count, device=affinity.device, dtype=affinity.dtype
+        )
+        laplacian = identity - normalized_affinity
+        laplacian = 0.5 * (laplacian + laplacian.transpose(0, 1))
+        eigenvalues = torch.linalg.eigvalsh(laplacian).clamp_min(0.0)
+
+        small_eigenvalues = eigenvalues[:cluster_count].square().mean()
+        next_eigenvalue = eigenvalues[cluster_count]
+        eigengap = F.relu(eigengap_margin - next_eigenvalue).square()
+        per_view.append(small_eigenvalues + eigengap)
+    res = smooth_worst_view(per_view, worst_view_temperature)
+    return res
 
 def multiview_loss_with_augmentation(
     images: Tensor,
@@ -773,6 +811,7 @@ def multiview_loss_with_augmentation(
     n_clusters: Sequence[int],
     minimum_effective_dimensions: float,
     augmented: tuple[dict[str, Any], dict[str, Any]] | None = None,
+eigengap_margin: float
 ) -> tuple[Tensor, dict[str, Tensor]]:
     if len(n_clusters) != len(outputs["affinities"]):
         raise ValueError("Provide one cluster count for every projected view.")
@@ -835,10 +874,18 @@ def multiview_loss_with_augmentation(
     #     ],
     #     weights.worst_view_temperature,
     # )
+
+    spectral_separation= spectral_cluster_separation_loss(
+        outputs["affinities"],
+        n_clusters,
+        eigengap_margin=eigengap_margin,
+        worst_view_temperature=weights.worst_view_temperature,
+    ),
     independence = 0.5 * (
         _pairwise_hsic(outputs["projected_views"])
         + _pairwise_hsic(outputs["affinities"])
     )
+
     maximize_latent_diversity = _maximize_latent_diversity(outputs["shared"])
     terms = {
         "reconstruction": F.mse_loss(outputs["reconstruction"], images),
@@ -853,7 +900,12 @@ def multiview_loss_with_augmentation(
         "projection_overlap": semi_orthogonal_overlap_loss(
             outputs["projection_weights"]
         ), # Not so sure whether this is necessary
-
+        "spectral_separation": spectral_cluster_separation_loss(
+        outputs["affinities"],
+        n_clusters,
+        eigengap_margin=eigengap_margin,
+        worst_view_temperature=weights.worst_view_temperature,
+    ),
         "beta_entropy": beta_entropy(outputs["beta"]),
         "beta_mass_balance": beta_mass_balance_loss(outputs["beta"]),
         "beta_effective_dimension": beta_effective_dimension_loss(
@@ -877,9 +929,10 @@ def train_phase(
     device: torch.device,
     weights: LossWeights,
     writer: Any | None,
-    augmentation_roles=("shape", "color"),
+    augmentation_roles=None,
     shape_recolor_strength = 0.6,
     color_shuffle_strength = 0.6,
+        eigengap_margin: float = 0.1,
 
 ) -> list[dict[str, float]]:
     _configure_phase(model, phase)
@@ -894,8 +947,11 @@ def train_phase(
         sums: dict[str, float] = {"total": 0.0}
         count = 0
         drop_ratio = 0.5
-        if phase == "joint" and epoch > 500:
-            weights.embedding_diversity = weights.embedding_diversity * drop_ratio
+        if phase == "joint":
+            weights.embedding_diversity = 0.0 #weights.embedding_diversity * drop_ratio
+        else:
+            weights.embedding_diversity = 0.01 # for training the self-expressive loss
+
         for images, _ in loader:
             images = images.to(device)
             left = (images + noise_std * torch.randn_like(images)).clamp(0, 1)
@@ -924,6 +980,7 @@ def train_phase(
                     n_clusters=model.n_clusters,
                     minimum_effective_dimensions=minimum_effective_dimensions,
                     augmented=augmented,
+                    eigengap_margin=eigengap_margin
                 )
             else:
                 total, terms = multiview_loss(
@@ -1159,9 +1216,9 @@ def evaluate_clustering(
     )
     print("  (Labels were not used during training.)")
 
-    output_file = f"./outputs/{args.dataset}_clustering_results.txt"
+    output_file = f"./outputs/{args.dataset}_{args.experiment_name}_clustering_results.txt"
 
-    with open(output_file, "w", encoding="utf-8") as file:
+    with open(output_file, "a+", encoding="utf-8") as file:
         print("\nOptimal one-to-one correspondence (evaluation only):", file=file)
 
         for match in matches:
@@ -1335,6 +1392,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-test-samples", type=int, default=None)
     parser.add_argument("--sample-index", type=int, default=0)
+    parser.add_argument("--eigengap-margin", type=float, default=0.2)
+    parser.add_argument("--experiment-name", type=str, default="v1")
     parser.add_argument(
         "--visualization", type=Path, default=Path("generic_multiview_views_soft_nmi_aug.html")
     )
@@ -1482,6 +1541,7 @@ def run(args: argparse.Namespace) -> None:
             weights=weights,
             writer=writer,
             augmentation_roles=args.augmentation_roles,
+            eigengap_margin=args.eigengap_margin,
         )
         print("evaluation after VIEW TRAINING")
         test_metrics = evaluate_clustering(
@@ -1506,6 +1566,7 @@ def run(args: argparse.Namespace) -> None:
             weights=weights,
             writer=writer,
             augmentation_roles=args.augmentation_roles,
+            eigengap_margin=args.eigengap_margin,
         )
         test_metrics = evaluate_clustering(
             model,

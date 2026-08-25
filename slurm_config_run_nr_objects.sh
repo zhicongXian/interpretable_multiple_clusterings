@@ -20,7 +20,7 @@ export BLAS=/usr/lib/x86_64-linux-gnu/blas/libblas.so.3
 export LAPACK=/usr/lib/x86_64-linux-gnu/lapack/liblapack.a
 # pip install -U pip setuptools wheel
 # train
-python3 ./generic_self_expressive_multiview_clustering.py --clusters=6,2,3 \
+python3 ./generic_self_expressive_multiview_clustering_v1.py --clusters=6,2,3 \
 --pretrain-epochs=1000 \
 --joint-epochs=1000 \
 --view-epochs=1000 \
