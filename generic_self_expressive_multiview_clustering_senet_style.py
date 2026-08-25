@@ -6,8 +6,9 @@ This program contains no semantic view-specific preprocessing.  Every image is
 processed by one shared ResNet autoencoder.  An orthogonal latent rotation,
 learned beta masks, and semi-orthogonal projection heads discover an arbitrary
 user-defined number of non-redundant views.  Each projected view is trained
-with its own sparse, zero-diagonal self-expression matrix.  Final labels are
-obtained by spectral clustering of the full-view affinities.
+with its own SENet-style neural coefficient generator.  The generated
+self-expression matrices are sparse, signed, and zero diagonal.  Final labels
+are obtained by spectral clustering of the learned full-view affinities.
 
 Required NPZ arrays::
 
@@ -32,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -74,48 +76,183 @@ def _limited(dataset: Dataset[Any], maximum: int | None, seed: int) -> Dataset[A
     return Subset(dataset, indices) # Subset of a dataset at specified indices.
 
 
-class BatchSelfExpression(nn.Module):
-    """Differentiable top-k convex self-expression for one latent view."""
+class SENetSelfExpression(nn.Module):
+    """Generate sparse signed self-expression coefficients from embeddings.
 
-    def __init__(self, temperature: float = 0.2, n_neighbors: int = 16) -> None:
+    For samples ``z_i`` and ``z_j``, this module implements
+
+    ``C_ij = alpha * T_b(cos(q(z_i), k(z_j)) / temperature)``,
+
+    where ``q`` and ``k`` are learned MLPs and ``T_b`` is signed soft
+    thresholding.  The diagonal is always zero.  Optionally retaining the
+    largest absolute ``n_neighbors`` scores makes the batch graph sparse
+    without imposing the convex-combination constraint of a row-wise softmax.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        *,
+        hidden_dim: int | None = None,
+        coefficient_dim: int | None = None,
+        temperature: float = 1.0,
+        n_neighbors: int = 16,
+        initial_threshold: float = 0.1,
+        initial_coefficient_scale: float = 0.1,
+        elastic_net_l1_ratio: float = 0.9,
+    ) -> None:
         super().__init__()
+        if input_dim < 1:
+            raise ValueError("self-expression input_dim must be positive.")
+        if hidden_dim is not None and hidden_dim < 1:
+            raise ValueError("hidden_dim must be positive when provided.")
+        if coefficient_dim is not None and coefficient_dim < 1:
+            raise ValueError("coefficient_dim must be positive when provided.")
         if temperature <= 0:
             raise ValueError("self-expression temperature must be positive.")
         if n_neighbors < 1:
             raise ValueError("self-expression n_neighbors must be positive.")
+        if initial_threshold <= 0:
+            raise ValueError("initial_threshold must be positive.")
+        if initial_coefficient_scale <= 0:
+            raise ValueError("initial_coefficient_scale must be positive.")
+        if not 0.0 <= elastic_net_l1_ratio <= 1.0:
+            raise ValueError("elastic_net_l1_ratio must lie in [0, 1].")
+
+        self.input_dim = int(input_dim)
+        self.hidden_dim = int(hidden_dim or max(32, input_dim))
+        self.coefficient_dim = int(coefficient_dim or input_dim)
         self.temperature = float(temperature)
         self.n_neighbors = int(n_neighbors)
+        self.elastic_net_l1_ratio = float(elastic_net_l1_ratio)
 
-    def forward(self, latent: Tensor) -> dict[str, Tensor]:
-        sample_count = latent.shape[0]
+        def make_pair_network() -> nn.Sequential:
+            return nn.Sequential(
+                nn.Linear(self.input_dim, self.hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(self.hidden_dim, self.coefficient_dim),
+            )
+
+        self.query_network = make_pair_network()
+        self.key_network = make_pair_network()
+        # Identical initialization starts from a learned-metric similarity
+        # graph; q and k are then free to specialize independently.
+        self.key_network.load_state_dict(self.query_network.state_dict())
+
+        self.raw_threshold = nn.Parameter(
+            torch.tensor(self._inverse_softplus(initial_threshold))
+        )
+        self.raw_coefficient_scale = nn.Parameter(
+            torch.tensor(self._inverse_softplus(initial_coefficient_scale))
+        )
+
+    @staticmethod
+    def _inverse_softplus(value: float) -> float:
+        return math.log(math.expm1(value))
+
+    @property
+    def threshold(self) -> Tensor:
+        return F.softplus(self.raw_threshold).clamp_min(1e-8)
+
+    @property
+    def coefficient_scale(self) -> Tensor:
+        return F.softplus(self.raw_coefficient_scale).clamp_min(1e-8)
+
+    def pair_embeddings(self, latent: Tensor) -> tuple[Tensor, Tensor]:
+        """Return normalized learned query and key embeddings."""
+
+        query = F.normalize(self.query_network(latent), dim=1, eps=1e-8)
+        key = F.normalize(self.key_network(latent), dim=1, eps=1e-8)
+        return query, key
+
+    def coefficient_matrix(
+        self,
+        query: Tensor,
+        key: Tensor,
+        *,
+        n_neighbors: int | None = None,
+    ) -> Tensor:
+        """Construct ``C`` from precomputed query and key embeddings."""
+
+        if query.ndim != 2 or key.ndim != 2 or query.shape != key.shape:
+            raise ValueError("query and key must be equally shaped matrices.")
+        sample_count = query.shape[0]
         if sample_count < 1:
             raise ValueError("Self-expression received an empty batch.")
         if sample_count == 1:
-            zeros = latent.new_zeros((1, 1))
-            return {
-                "coefficients": zeros,
-                "affinity": zeros,
-                "reconstructed_latent": latent,
-            }
+            return query.new_zeros((1, 1))
 
-        normalized = F.normalize(latent, dim=1, eps=1e-8)
-        scores = normalized @ normalized.transpose(0, 1)
-        scores = scores / self.temperature
-        diagonal = torch.eye(sample_count, dtype=torch.bool, device=latent.device)
-        scores = scores.masked_fill(diagonal, float("-inf"))
-        neighbor_count = min(self.n_neighbors, sample_count - 1)
+        scores = (query @ key.transpose(0, 1)) / self.temperature
+        diagonal = torch.eye(
+            sample_count, dtype=torch.bool, device=scores.device
+        )
+        scores = scores.masked_fill(diagonal, 0.0)
+
+        requested_neighbors = self.n_neighbors if n_neighbors is None else n_neighbors
+        if requested_neighbors < 1:
+            raise ValueError("n_neighbors must be positive.")
+        neighbor_count = min(int(requested_neighbors), sample_count - 1)
+        support = ~diagonal
         if neighbor_count < sample_count - 1:
-            values, indices = torch.topk(scores, k=neighbor_count, dim=1)
-            sparse_scores = torch.full_like(scores, float("-inf"))
-            sparse_scores.scatter_(1, indices, values)
-            scores = sparse_scores
-        coefficients = torch.softmax(scores, dim=1)
-        affinity = 0.5 * (coefficients + coefficients.transpose(0, 1))
-        affinity = affinity.masked_fill(diagonal, 0.0)
+            ranking_scores = scores.abs().masked_fill(diagonal, float("-inf"))
+            indices = torch.topk(
+                ranking_scores, k=neighbor_count, dim=1
+            ).indices
+            support = torch.zeros_like(diagonal)
+            support.scatter_(1, indices, True)
+
+        threshold = self.threshold.to(device=scores.device, dtype=scores.dtype)
+        scale = self.coefficient_scale.to(
+            device=scores.device, dtype=scores.dtype
+        )
+        coefficients = scale * scores.sign() * F.relu(scores.abs() - threshold)
+        coefficients = coefficients.masked_fill(~support, 0.0)
+        coefficients = coefficients.masked_fill(diagonal, 0.0)
+        return coefficients
+
+    @staticmethod
+    def affinity_from_coefficients(coefficients: Tensor) -> Tensor:
+        """Create the nonnegative symmetric affinity used by spectral clustering."""
+
+        affinity = 0.5 * (
+            coefficients.abs() + coefficients.transpose(0, 1).abs()
+        )
+        diagonal = torch.eye(
+            coefficients.shape[0],
+            dtype=torch.bool,
+            device=coefficients.device,
+        )
+        return affinity.masked_fill(diagonal, 0.0)
+
+    def elastic_net_regularization(self, coefficients: Tensor) -> Tensor:
+        """Batch-size-stable elastic-net penalty for generated coefficients."""
+
+        if coefficients.shape[0] <= 1:
+            return coefficients.new_zeros(())
+        neighbor_count = min(self.n_neighbors, coefficients.shape[1] - 1)
+        normalizer = float(max(neighbor_count, 1))
+        l1 = coefficients.abs().sum(dim=1).mean() / normalizer
+        l2 = coefficients.square().sum(dim=1).mean() / normalizer
+        ratio = self.elastic_net_l1_ratio
+        return ratio * l1 + 0.5 * (1.0 - ratio) * l2
+
+    def forward(
+        self,
+        latent: Tensor,
+        *,
+        n_neighbors: int | None = None,
+    ) -> dict[str, Tensor]:
+        query, key = self.pair_embeddings(latent)
+        coefficients = self.coefficient_matrix(
+            query, key, n_neighbors=n_neighbors
+        )
         return {
             "coefficients": coefficients,
-            "affinity": affinity,
+            "affinity": self.affinity_from_coefficients(coefficients),
             "reconstructed_latent": coefficients @ latent,
+            "elastic_net": self.elastic_net_regularization(coefficients),
+            "query": query,
+            "key": key,
         }
 
 class SemiOrthogonalProjectionHead(nn.Module):
@@ -161,8 +298,13 @@ class GenericSelfExpressiveMultiView(nn.Module):
         encoder_channels: Sequence[int] = (16, 32, 64),
         encoder_blocks: Sequence[int] = (1, 1, 1),
         decoder_channels: Sequence[int] = (64, 32, 16, 8),
-        self_expression_temperature: float = 0.2,
+        self_expression_temperature: float = 1.0,
         self_expression_neighbors: int = 16,
+        self_expression_hidden_dim: int | None = None,
+        self_expression_coefficient_dim: int | None = None,
+        self_expression_threshold: float = 0.1,
+        self_expression_coefficient_scale: float = 0.1,
+        elastic_net_l1_ratio: float = 0.9,
     ) -> None:
         super().__init__()
         self.image_shape = tuple(int(value) for value in image_shape)
@@ -212,9 +354,15 @@ class GenericSelfExpressiveMultiView(nn.Module):
         )
         self.self_expression_heads = nn.ModuleList(
             [
-                BatchSelfExpression(
-                    self_expression_temperature,
-                    self_expression_neighbors,
+                SENetSelfExpression(
+                    self.projection_dim,
+                    hidden_dim=self_expression_hidden_dim,
+                    coefficient_dim=self_expression_coefficient_dim,
+                    temperature=self_expression_temperature,
+                    n_neighbors=self_expression_neighbors,
+                    initial_threshold=self_expression_threshold,
+                    initial_coefficient_scale=self_expression_coefficient_scale,
+                    elastic_net_l1_ratio=elastic_net_l1_ratio,
                 )
                 for _ in range(self.n_views)
             ]
@@ -279,7 +427,7 @@ class LossWeightsForAugmentation:
     reconstruction: float = 0.25
     self_expression: float = 0.2
     cluster_structure: float = 0.1
-    coefficient_entropy: float = 0.002
+    coefficient_regularization: float = 0.002
     stability: float = 0.05
     augmentation_consistency: float = 0.0 # 0.1#0.05
     independence: float = 0.06 #0.02 # 0.02
@@ -296,7 +444,7 @@ class LossWeightsForAugmentation:
 class LossWeights:
     reconstruction: float = 1.0
     self_expression: float = 0.2
-    coefficient_entropy: float = 0.02
+    coefficient_regularization: float = 0.02
     stability: float = 0.05
     independence: float = 0.05
     projection_overlap: float = 0.02
@@ -475,11 +623,8 @@ def multiview_loss(
         ],
         weights.worst_view_temperature,
     )
-    coefficient_entropy = smooth_worst_view(
-        [
-            -(coefficients * coefficients.clamp_min(1e-8).log()).sum(dim=1).mean()
-            for coefficients in outputs["coefficients"]
-        ],
+    coefficient_regularization = smooth_worst_view(
+        [item["elastic_net"] for item in outputs["self_expression"]],
         weights.worst_view_temperature,
     )
     stability = (
@@ -512,7 +657,7 @@ def multiview_loss(
     terms = {
         "reconstruction": F.mse_loss(outputs["reconstruction"], images),
         "self_expression": self_expression,
-        "coefficient_entropy": coefficient_entropy,
+        "coefficient_regularization": coefficient_regularization,
         "stability": stability,
         "independence": independence,
         "projection_overlap": semi_orthogonal_overlap_loss(
@@ -599,6 +744,9 @@ def _configure_phase(model: GenericSelfExpressiveMultiView, phase: str) -> None:
     model.rotation_raw.requires_grad_(True)
     model.beta_logits.requires_grad_(True)
     for head in model.projection_heads:
+        for parameter in head.parameters():
+            parameter.requires_grad_(True)
+    for head in model.self_expression_heads:
         for parameter in head.parameters():
             parameter.requires_grad_(True)
 
@@ -824,11 +972,8 @@ eigengap_margin: float
         ],
         weights.worst_view_temperature,
     )
-    coefficient_entropy = smooth_worst_view(
-        [
-            -(coefficients * coefficients.clamp_min(1e-8).log()).sum(dim=1).mean()
-            for coefficients in outputs["coefficients"]
-        ],
+    coefficient_regularization = smooth_worst_view(
+        [item["elastic_net"] for item in outputs["self_expression"]],
         weights.worst_view_temperature,
     )
     stability = (
@@ -890,7 +1035,7 @@ eigengap_margin: float
     terms = {
         "reconstruction": F.mse_loss(outputs["reconstruction"], images),
         "self_expression": self_expression,
-        "coefficient_entropy": coefficient_entropy,
+        "coefficient_regularization": coefficient_regularization,
         "stability": stability,
         "augmentation_consistency": augmentation_consistency,
         "independence": independence,
@@ -946,11 +1091,9 @@ def train_phase(
         model.train()
         sums: dict[str, float] = {"total": 0.0}
         count = 0
-        drop_ratio = 0.5
-        if phase == "joint":
-            weights.embedding_diversity = 0.0 #weights.embedding_diversity * drop_ratio
-        else:
-            weights.embedding_diversity = 0.01 # for training the self-expressive loss
+        # This term stays disabled in every phase. View independence is already
+        # enforced explicitly; dispersing the shared embedding is not needed.
+        weights.embedding_diversity = 0.0
 
         for images, _ in loader:
             images = images.to(device)
@@ -1014,6 +1157,17 @@ def train_phase(
                     float(beta[view].mean()),
                     epoch,
                 )
+                self_expression_head = model.self_expression_heads[view]
+                writer.add_scalar(
+                    f"{phase}/self_expression_threshold/{name}",
+                    float(self_expression_head.threshold.detach()),
+                    epoch,
+                )
+                writer.add_scalar(
+                    f"{phase}/self_expression_scale/{name}",
+                    float(self_expression_head.coefficient_scale.detach()),
+                    epoch,
+                )
     _configure_phase(model, "joint")
     return history
 
@@ -1055,31 +1209,35 @@ def collect_views_general(
     return [torch.cat(items) for items in batches], np.concatenate(label_batches)
 
 
+@torch.no_grad()
 def self_expression_affinity(
+    head: SENetSelfExpression,
     latent: Tensor,
     *,
-    temperature: float,
     n_neighbors: int,
+    device: torch.device,
+    transform_batch_size: int = 4096,
 ) -> np.ndarray:
     if latent.ndim != 2 or latent.shape[0] < 2:
         raise ValueError("Full-view self-expression requires at least two samples.")
-    if temperature <= 0 or n_neighbors < 1:
-        raise ValueError("temperature and n_neighbors must be positive.")
-    sample_count = latent.shape[0]
-    normalized = F.normalize(latent.float(), dim=1, eps=1e-8)
-    scores = normalized @ normalized.transpose(0, 1)
-    scores = scores / temperature
-    diagonal = torch.eye(sample_count, dtype=torch.bool)
-    scores = scores.masked_fill(diagonal, float("-inf"))
-    neighbor_count = min(n_neighbors, sample_count - 1)
-    if neighbor_count < sample_count - 1:
-        values, indices = torch.topk(scores, k=neighbor_count, dim=1)
-        sparse_scores = torch.full_like(scores, float("-inf"))
-        sparse_scores.scatter_(1, indices, values)
-        scores = sparse_scores
-    coefficients = torch.softmax(scores, dim=1)
-    affinity = 0.5 * (coefficients + coefficients.transpose(0, 1))
-    affinity.fill_diagonal_(0.0)
+    if n_neighbors < 1 or transform_batch_size < 1:
+        raise ValueError("n_neighbors and transform_batch_size must be positive.")
+
+    # Only the small neural transformations are evaluated on the model device.
+    # The O(N^2) coefficient/affinity matrices stay on CPU, as in the previous
+    # full-dataset evaluation path, to avoid unnecessary GPU memory pressure.
+    query_batches: list[Tensor] = []
+    key_batches: list[Tensor] = []
+    for batch in latent.float().split(transform_batch_size):
+        query, key = head.pair_embeddings(batch.to(device))
+        query_batches.append(query.detach().cpu())
+        key_batches.append(key.detach().cpu())
+    query = torch.cat(query_batches, dim=0)
+    key = torch.cat(key_batches, dim=0)
+    coefficients = head.coefficient_matrix(
+        query, key, n_neighbors=n_neighbors
+    )
+    affinity = head.affinity_from_coefficients(coefficients)
     return affinity.numpy()
 
 
@@ -1104,7 +1262,6 @@ def evaluate_clustering(
     device: torch.device,
     dataset: str,
     *,
-    temperature: float,
     n_neighbors: int,
     random_state: int,
 ) -> dict[str, Any]:
@@ -1118,9 +1275,10 @@ def evaluate_clustering(
     predictions: list[np.ndarray] = []
     for view, latent in enumerate(latents):
         affinity = self_expression_affinity(
+            model.self_expression_heads[view],
             latent,
-            temperature=temperature,
             n_neighbors=n_neighbors,
+            device=device,
         )
         predictions.append(
             SpectralClustering(
@@ -1376,8 +1534,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--encoder-channels", type=_integer_tuple, default=(16, 32, 64))
     parser.add_argument("--encoder-blocks", type=_integer_tuple, default=(1, 1, 1))
     parser.add_argument("--decoder-channels", type=_integer_tuple, default=(64, 32, 16, 8))
-    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="Temperature applied to learned query-key similarities.",
+    )
     parser.add_argument("--self-expression-neighbors", type=int, default=16)
+    parser.add_argument("--senet-hidden-dim", type=int, default=None)
+    parser.add_argument("--senet-coefficient-dim", type=int, default=None)
+    parser.add_argument("--senet-threshold", type=float, default=0.1)
+    parser.add_argument("--senet-coefficient-scale", type=float, default=0.1)
+    parser.add_argument("--elastic-net-l1-ratio", type=float, default=0.9)
     parser.add_argument("--spectral-neighbors", type=int, default=20)
     parser.add_argument("--minimum-effective-dimensions", type=float, default=None)
     parser.add_argument("--pretrain-epochs", type=int, default=200)
@@ -1475,6 +1643,11 @@ def run(args: argparse.Namespace) -> None:
         decoder_channels=args.decoder_channels,
         self_expression_temperature=args.temperature,
         self_expression_neighbors=args.self_expression_neighbors,
+        self_expression_hidden_dim=args.senet_hidden_dim,
+        self_expression_coefficient_dim=args.senet_coefficient_dim,
+        self_expression_threshold=args.senet_threshold,
+        self_expression_coefficient_scale=args.senet_coefficient_scale,
+        elastic_net_l1_ratio=args.elastic_net_l1_ratio,
     ).to(device)
     minimum_effective_dimensions = (
         float(args.minimum_effective_dimensions)
@@ -1525,7 +1698,6 @@ def run(args: argparse.Namespace) -> None:
             args.dataset_path,
             device,
             dataset = args.dataset,
-            temperature=args.temperature,
             n_neighbors=args.spectral_neighbors,
             random_state=args.seed,
         )
@@ -1550,7 +1722,6 @@ def run(args: argparse.Namespace) -> None:
             args.dataset_path,
             device,
             dataset = args.dataset,
-            temperature=args.temperature,
             n_neighbors=args.spectral_neighbors,
             random_state=args.seed,
         )
@@ -1574,7 +1745,6 @@ def run(args: argparse.Namespace) -> None:
             args.dataset_path,
             device,
             dataset = args.dataset,
-            temperature=args.temperature,
             n_neighbors=args.spectral_neighbors,
             random_state=args.seed,
         )
@@ -1637,19 +1807,24 @@ def inference(args: argparse.Namespace):
         decoder_channels=args.decoder_channels,
         self_expression_temperature=args.temperature,
         self_expression_neighbors=args.self_expression_neighbors,
+        self_expression_hidden_dim=args.senet_hidden_dim,
+        self_expression_coefficient_dim=args.senet_coefficient_dim,
+        self_expression_threshold=args.senet_threshold,
+        self_expression_coefficient_scale=args.senet_coefficient_scale,
+        elastic_net_l1_ratio=args.elastic_net_l1_ratio,
     ).to(device)
 
     model.load_state_dict(checkpoint["state_dict"], strict=True)
     model = model.to(device)
     model.eval()
     test_metrics = evaluate_clustering(
-            model,
-            test_loader,
-            args.dataset,
-            device,
-            temperature=args.temperature,
-            n_neighbors=args.spectral_neighbors,
-            random_state=args.seed,
+        model,
+        test_loader,
+        args.dataset_path,
+        device,
+        dataset=args.dataset,
+        n_neighbors=args.spectral_neighbors,
+        random_state=args.seed,
         )
     test_images, _ = next(iter(test_loader))
     if not 0 <= args.sample_index < len(test_images):

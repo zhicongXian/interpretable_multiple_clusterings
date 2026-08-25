@@ -20,12 +20,12 @@ export BLAS=/usr/lib/x86_64-linux-gnu/blas/libblas.so.3
 export LAPACK=/usr/lib/x86_64-linux-gnu/lapack/liblapack.a
 # pip install -U pip setuptools wheel
 # train
-python3 ./generic_self_expressive_multiview_clustering_v1.py --clusters=3,3 \
+python3 ./generic_self_expressive_multiview_clustering_senet_style.py --clusters=3,3 \
 --pretrain-epochs=5000 \
 --joint-epochs=1000 \
 --view-epochs=1000 \
---checkpoint=./outputs/stickfigures_v1.pt \
---visualization=./outputs/stickfigures_v1.html \
+--checkpoint=./outputs/stickfigures_senet.pt \
+--visualization=./outputs/stickfigures_senet.html \
 --dataset=stickfigures \
 --tensorboard-log-dir=./outputs/runs_stickfigures/ \
 --dataset-path=data/datasets/enrc_data/stickfigures >> ./outputs/deep_imc_stickfigures_out.txt
