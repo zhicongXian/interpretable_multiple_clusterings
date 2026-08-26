@@ -1,5 +1,3 @@
-# In this v1 version, I will add the diversity regularization loss and minimizing normalized eigenmap
-
 r"""Generic deep self-expressive multiple-view clustering for images.
 
 This program contains no semantic view-specific preprocessing.  Every image is
@@ -276,14 +274,14 @@ class GenericSelfExpressiveMultiView(nn.Module):
 class LossWeightsForAugmentation:
     # Reconstruction is already optimized during pretraining. A smaller joint
     # weight lets clustering reorganize the shared representation.
-    reconstruction: float = 0.25
+    reconstruction: float = 1.0
     self_expression: float = 0.2
     cluster_structure: float = 0.1
-    coefficient_entropy: float = 0.002
+    coefficient_entropy: float = 0.02
     stability: float = 0.05
-    augmentation_consistency: float = 0.0 # 0.1#0.05
+    augmentation_consistency: float = 0.1 # 0.1#0.05
     independence: float = 0.06 #0.02 # 0.02
-    projection_orthogonality: float = 0.1
+    projection_orthogonality: float = 0.01#0.1
     projection_overlap: float = 0.005 # 0.05
     beta_entropy: float = 0.01
     beta_mass_balance: float = 0.2
@@ -291,7 +289,6 @@ class LossWeightsForAugmentation:
     latent_variance: float = 0.05
     worst_view_temperature: float = 0.1
     embedding_diversity: float = 0.0 # 0.00002
-    spectral_separation: float = 0.2
 @dataclass # (frozen=True)
 class LossWeights:
     reconstruction: float = 1.0
@@ -568,9 +565,9 @@ def pretrain_autoencoder(
             recon_loss = F.mse_loss(model.autoencode(corrupted), images)
             latent_image = model.encoder(images)
             latent_corrupted= model.encoder(corrupted)
-            mcr_loss_tensor = 0.5 * (total_coding_rate(latent_image, latent_image) + total_coding_rate(latent_corrupted,
+            mcr_loss_tensor = 0.5 * loss_weight * (total_coding_rate(latent_image, latent_image) + total_coding_rate(latent_corrupted,
                                                                                                    latent_corrupted))
-            loss = recon_loss +  loss_weight * mcr_loss_tensor
+            loss = recon_loss + mcr_loss_tensor
             loss.backward()
             optimizer.step()
             running += float(loss.detach()) * images.shape[0]
@@ -584,7 +581,6 @@ def pretrain_autoencoder(
               f"mcr_loss={mcr_loss}")
         if writer is not None:
             writer.add_scalar("pretrain/reconstruction", value, epoch)
-            writer.add_scalar("pretrain/mcr", mcr_loss, epoch)
     return history
 
 
@@ -668,6 +664,41 @@ def _shuffle_space_preserve_color(images: Tensor, strength: float) -> Tensor:
     shuffled = flattened.gather(2, gather_indices).view_as(images)
     return (1.0 - strength) * images + strength * shuffled
 
+
+def _mask_vertical_region(
+    images: Tensor,
+    region: str,
+    *,
+    split_fraction: float,
+    strength: float,
+) -> Tensor:
+    """Mask the upper or lower image region with the zero/background value.
+
+    ``split_fraction`` is the boundary measured from the top of the image.
+    ``strength=1`` completely removes the selected region, while smaller
+    values blend the original pixels with the masked image.
+    """
+
+    if region not in {"upper", "lower"}:
+        raise ValueError("region must be either 'upper' or 'lower'.")
+    if not 0.0 < split_fraction < 1.0:
+        raise ValueError("split_fraction must lie strictly between 0 and 1.")
+    if not 0.0 <= strength <= 1.0:
+        raise ValueError("mask strength must lie in [0, 1].")
+    if images.ndim != 4 or images.shape[-2] < 2:
+        raise ValueError("images must have shape [N, C, H, W] with H >= 2.")
+
+    height = images.shape[-2]
+    split_row = min(max(int(round(height * split_fraction)), 1), height - 1)
+    keep_mask = images.new_ones((1, 1, height, 1))
+    if region == "upper":
+        keep_mask[..., :split_row, :] = 0.0
+    else:
+        keep_mask[..., split_row:, :] = 0.0
+    masked = images * keep_mask
+    return (1.0 - strength) * images + strength * masked
+
+
 def augment_for_view(
     images: Tensor,
     role: str,
@@ -675,8 +706,14 @@ def augment_for_view(
     noise_std: float,
     shape_recolor_strength: float,
     color_shuffle_strength: float,
+    upper_lower_mask_split: float = 0.5,
+    upper_lower_mask_strength: float = 1.0,
 ) -> Tensor:
-    """Create an augmentation that removes nuisance information for one view."""
+    """Create an augmentation that removes nuisance information for one view.
+
+    Role names describe the content to preserve. Thus, ``upper`` masks the
+    lower region, while ``lower`` masks the upper region.
+    """
 
     augmented = _mild_spatial_augmentation(images)
     if role == "shape": # --TODO is the way to do data augmentation correct?
@@ -686,6 +723,20 @@ def augment_for_view(
     elif role == "color":
         augmented = _shuffle_space_preserve_color(
             augmented, color_shuffle_strength
+        )
+    elif role == "upper":
+        augmented = _mask_vertical_region(
+            images,
+            "lower",
+            split_fraction=upper_lower_mask_split,
+            strength=upper_lower_mask_strength,
+        )
+    elif role == "lower":
+        augmented = _mask_vertical_region(
+            images,
+            "upper",
+            split_fraction=upper_lower_mask_split,
+            strength=upper_lower_mask_strength,
         )
     elif role != "generic":
         raise ValueError(f"Unknown augmentation role: {role}")
@@ -702,9 +753,13 @@ def view_specific_augmented_outputs(
     noise_std: float,
     shape_recolor_strength: float,
     color_shuffle_strength: float,
+    upper_lower_mask_split: float = 0.5,
+    upper_lower_mask_strength: float = 1.0,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Efficiently extract matching view outputs from semantic augmentations."""
 
+    if len(roles) != model.n_views:
+        raise ValueError("Provide exactly one augmentation role for every view.")
     batch_size = images.shape[0]
     augmented_batches = [
         augment_for_view(
@@ -713,6 +768,8 @@ def view_specific_augmented_outputs(
             noise_std=noise_std,
             shape_recolor_strength=shape_recolor_strength,
             color_shuffle_strength=color_shuffle_strength,
+            upper_lower_mask_split=upper_lower_mask_split,
+            upper_lower_mask_strength=upper_lower_mask_strength,
         )
         for _ in range(2)
         for role in roles
@@ -759,49 +816,6 @@ def semi_orthogonality_loss(projection_weights: Sequence[Tensor]) -> Tensor:
         penalties.append(gram_error.square().mean())
     return torch.stack(penalties).mean()
 
-def spectral_cluster_separation_loss(
-    affinities: Sequence[Tensor],
-    n_clusters: Sequence[int],
-    *,
-    eigengap_margin: float,
-    worst_view_temperature: float,
-    eps: float = 1e-8,
-) -> Tensor:
-    """Encourage exactly ``K_v`` graph components in every view.
-
-    For the normalized Laplacian, the first ``K_v`` eigenvalues are pushed
-    towards zero, while eigenvalue ``K_v + 1`` is kept above a margin. Batches
-    with no ``K_v + 1`` eigenvalue are skipped for this term.
-    """
-
-    per_view: list[Tensor] = []
-    for affinity, cluster_count in zip(affinities, n_clusters):
-        sample_count = affinity.shape[0]
-        if sample_count <= cluster_count:
-            per_view.append(affinity.new_zeros(()))
-            continue
-
-        affinity = 0.5 * (affinity + affinity.transpose(0, 1))
-        degree = affinity.sum(dim=1).clamp_min(eps)
-        inverse_sqrt_degree = degree.rsqrt()
-        normalized_affinity = (
-            inverse_sqrt_degree[:, None]
-            * affinity
-            * inverse_sqrt_degree[None, :]
-        )
-        identity = torch.eye(
-            sample_count, device=affinity.device, dtype=affinity.dtype
-        )
-        laplacian = identity - normalized_affinity
-        laplacian = 0.5 * (laplacian + laplacian.transpose(0, 1))
-        eigenvalues = torch.linalg.eigvalsh(laplacian).clamp_min(0.0)
-
-        small_eigenvalues = eigenvalues[:cluster_count].square().mean()
-        next_eigenvalue = eigenvalues[cluster_count]
-        eigengap = F.relu(eigengap_margin - next_eigenvalue).square()
-        per_view.append(small_eigenvalues + eigengap)
-    res = smooth_worst_view(per_view, worst_view_temperature)
-    return res
 
 def multiview_loss_with_augmentation(
     images: Tensor,
@@ -811,7 +825,6 @@ def multiview_loss_with_augmentation(
     n_clusters: Sequence[int],
     minimum_effective_dimensions: float,
     augmented: tuple[dict[str, Any], dict[str, Any]] | None = None,
-eigengap_margin: float
 ) -> tuple[Tensor, dict[str, Tensor]]:
     if len(n_clusters) != len(outputs["affinities"]):
         raise ValueError("Provide one cluster count for every projected view.")
@@ -874,18 +887,10 @@ eigengap_margin: float
     #     ],
     #     weights.worst_view_temperature,
     # )
-
-    spectral_separation= spectral_cluster_separation_loss(
-        outputs["affinities"],
-        n_clusters,
-        eigengap_margin=eigengap_margin,
-        worst_view_temperature=weights.worst_view_temperature,
-    ),
     independence = 0.5 * (
         _pairwise_hsic(outputs["projected_views"])
         + _pairwise_hsic(outputs["affinities"])
     )
-
     maximize_latent_diversity = _maximize_latent_diversity(outputs["shared"])
     terms = {
         "reconstruction": F.mse_loss(outputs["reconstruction"], images),
@@ -900,12 +905,7 @@ eigengap_margin: float
         "projection_overlap": semi_orthogonal_overlap_loss(
             outputs["projection_weights"]
         ), # Not so sure whether this is necessary
-        "spectral_separation": spectral_cluster_separation_loss(
-        outputs["affinities"],
-        n_clusters,
-        eigengap_margin=eigengap_margin,
-        worst_view_temperature=weights.worst_view_temperature,
-    ),
+
         "beta_entropy": beta_entropy(outputs["beta"]),
         "beta_mass_balance": beta_mass_balance_loss(outputs["beta"]),
         "beta_effective_dimension": beta_effective_dimension_loss(
@@ -932,8 +932,8 @@ def train_phase(
     augmentation_roles=None,
     shape_recolor_strength = 0.6,
     color_shuffle_strength = 0.6,
-        eigengap_margin: float = 0.1,
-
+    upper_lower_mask_split: float = 0.5,
+    upper_lower_mask_strength: float = 1.0,
 ) -> list[dict[str, float]]:
     _configure_phase(model, phase)
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
@@ -947,11 +947,8 @@ def train_phase(
         sums: dict[str, float] = {"total": 0.0}
         count = 0
         drop_ratio = 0.5
-        if phase == "joint":
-            weights.embedding_diversity = 0.0 #weights.embedding_diversity * drop_ratio
-        else:
-            weights.embedding_diversity = 0.01 # for training the self-expressive loss
-
+        if phase == "joint" and epoch > 500:
+            weights.embedding_diversity = weights.embedding_diversity * drop_ratio
         for images, _ in loader:
             images = images.to(device)
             left = (images + noise_std * torch.randn_like(images)).clamp(0, 1)
@@ -971,6 +968,8 @@ def train_phase(
                         noise_std=noise_std,
                         shape_recolor_strength=shape_recolor_strength,
                         color_shuffle_strength=color_shuffle_strength,
+                        upper_lower_mask_split=upper_lower_mask_split,
+                        upper_lower_mask_strength=upper_lower_mask_strength,
                     )
 
                 total, terms = multiview_loss_with_augmentation(
@@ -980,7 +979,6 @@ def train_phase(
                     n_clusters=model.n_clusters,
                     minimum_effective_dimensions=minimum_effective_dimensions,
                     augmented=augmented,
-                    eigengap_margin=eigengap_margin
                 )
             else:
                 total, terms = multiview_loss(
@@ -1216,7 +1214,7 @@ def evaluate_clustering(
     )
     print("  (Labels were not used during training.)")
 
-    output_file = f"./outputs/{args.dataset}_{args.experiment_name}_clustering_results.txt"
+    output_file = f"./outputs/{args.dataset}_clustering_results.txt"
 
     with open(output_file, "a+", encoding="utf-8") as file:
         print("\nOptimal one-to-one correspondence (evaluation only):", file=file)
@@ -1368,7 +1366,7 @@ def visualize_views(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=str, required=True)
-    parser.add_argument("--dataset-path", type=Path, required=True)#default=Path("shape_color_multiview_dataset.npz"))
+    parser.add_argument("--dataset-path", type=Path, default=Path("shape_color_multiview_dataset.npz"))
     parser.add_argument("--clusters", type=_integer_tuple, required=True)
     parser.add_argument("--view-names", type=_string_tuple, default=None)
     parser.add_argument("--latent-dim", type=int, default=64)
@@ -1388,12 +1386,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--view-learning-rate", type=float, default=1e-4)
     parser.add_argument("--joint-learning-rate", type=float, default=1e-4)
     parser.add_argument("--noise-std", type=float, default=0.01)
+    parser.add_argument(
+        "--upper-lower-mask-split",
+        type=float,
+        default=0.5,
+        help="Vertical upper/lower boundary as a fraction of image height.",
+    )
+    parser.add_argument(
+        "--upper-lower-mask-strength",
+        type=float,
+        default=1.0,
+        help="Strength of upper/lower masking in [0, 1].",
+    )
     parser.add_argument("--tensorboard-log-dir", type=Path, default=None)
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-test-samples", type=int, default=None)
     parser.add_argument("--sample-index", type=int, default=0)
-    parser.add_argument("--eigengap-margin", type=float, default=0.2)
-    parser.add_argument("--experiment-name", type=str, default="v1")
     parser.add_argument(
         "--visualization", type=Path, default=Path("generic_multiview_views_soft_nmi_aug.html")
     )
@@ -1411,7 +1419,9 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Comma-separated semantic content preserved by each view. "
-            "For the shape-color dataset use: shape,color."
+            "Use shape,color for the shape-color dataset or upper,lower "
+            "for stick figures. The upper role masks the lower image region, "
+            "and the lower role masks the upper region."
         ),
     )
     return parser.parse_args()
@@ -1447,6 +1457,22 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("Epoch counts must be nonnegative.")
     if args.view_names is not None and len(args.view_names) != len(args.clusters):
         raise ValueError("view-names and clusters must have the same length.")
+    if not 0.0 < args.upper_lower_mask_split < 1.0:
+        raise ValueError("upper-lower-mask-split must lie strictly between 0 and 1.")
+    if not 0.0 <= args.upper_lower_mask_strength <= 1.0:
+        raise ValueError("upper-lower-mask-strength must lie in [0, 1].")
+    if args.dataset.lower() == "stickfigures" and args.augmentation_roles is None:
+        if len(args.clusters) != 2:
+            raise ValueError(
+                "Automatic stick-figure augmentation requires exactly two views. "
+                "Otherwise provide --augmentation-roles explicitly."
+            )
+        args.augmentation_roles = ("upper", "lower")
+    if (
+        args.augmentation_roles is not None
+        and len(args.augmentation_roles) != len(args.clusters)
+    ):
+        raise ValueError("Provide exactly one augmentation role for every view.")
     set_seed(args.seed)
     if args.dataset.lower() == "synthetic_shape_color":
         train_loader, test_loader = get_dataloaders_for_synthetic_shape_color(args)
@@ -1541,7 +1567,8 @@ def run(args: argparse.Namespace) -> None:
             weights=weights,
             writer=writer,
             augmentation_roles=args.augmentation_roles,
-            eigengap_margin=args.eigengap_margin,
+            upper_lower_mask_split=args.upper_lower_mask_split,
+            upper_lower_mask_strength=args.upper_lower_mask_strength,
         )
         print("evaluation after VIEW TRAINING")
         test_metrics = evaluate_clustering(
@@ -1566,7 +1593,8 @@ def run(args: argparse.Namespace) -> None:
             weights=weights,
             writer=writer,
             augmentation_roles=args.augmentation_roles,
-            eigengap_margin=args.eigengap_margin,
+            upper_lower_mask_split=args.upper_lower_mask_split,
+            upper_lower_mask_strength=args.upper_lower_mask_strength,
         )
         test_metrics = evaluate_clustering(
             model,

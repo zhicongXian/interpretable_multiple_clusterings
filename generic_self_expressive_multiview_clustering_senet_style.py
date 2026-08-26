@@ -702,7 +702,7 @@ def multiview_loss(
     )
     independence = 0.5 * (
         _pairwise_hsic(outputs["projected_views"])
-        + _pairwise_hsic_projected_view(outputs["affinities"])#_pairwise_hsic(outputs["affinities"])
+        + _pairwise_hsic(outputs["affinities"])#_pairwise_hsic(outputs["affinities"])
     )
     maximize_latent_diversity = _maximize_latent_diversity(outputs["shared"])
     terms = {
