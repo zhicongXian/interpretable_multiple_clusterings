@@ -152,11 +152,23 @@ class SENetSelfExpression(nn.Module):
 
     @property
     def threshold(self) -> Tensor:
-        return F.softplus(self.raw_threshold).clamp_min(1e-8)
+        # Cosine scores lie in [-1 / temperature, 1 / temperature].  A larger
+        # threshold is equivalent to this upper bound but can create Inf * 0
+        # later if both learned positive scalars diverge.
+        return F.softplus(self.raw_threshold).clamp(
+            min=1e-8,
+            max=1.0 / self.temperature,
+        )
 
     @property
     def coefficient_scale(self) -> Tensor:
-        return F.softplus(self.raw_coefficient_scale).clamp_min(1e-8)
+        # Keep generated coefficients in a numerically useful range.  This is
+        # deliberately well above the default 0.1 and does not impose a convex
+        # combination constraint.
+        return F.softplus(self.raw_coefficient_scale).clamp(
+            min=1e-8,
+            max=10.0,
+        )
 
     def pair_embeddings(self, latent: Tensor) -> tuple[Tensor, Tensor]:
         """Return normalized learned query and key embeddings."""
@@ -277,12 +289,14 @@ class SemiOrthogonalProjectionHead(nn.Module):
         signs = torch.where(signs == 0, torch.ones_like(signs), signs)
         return (basis * signs.unsqueeze(0)).transpose(0, 1)
 
+    def effective_weight(self) -> Tensor:
+        """Return the same projection matrix that is used in ``forward``."""
+
+        return self.orthonormal_weight() if self.exactly_orthogonal else self.weight_raw
+
     def forward(self, inputs: Tensor, beta: Tensor) -> Tensor:
         weighted = inputs * beta.clamp_min(1e-8).sqrt().unsqueeze(0)
-        if self.exactly_orthogonal:
-            return F.linear(weighted, self.orthonormal_weight())
-        else:
-            return F.linear(weighted, self.weight_raw)
+        return F.linear(weighted, self.effective_weight())
 
 
 class SoftClusterAssignmentHead(nn.Module):
@@ -448,7 +462,7 @@ class GenericSelfExpressiveMultiView(nn.Module):
             "beta": beta,
             "projected_views": projected_views,
             "projection_weights": [
-                head.orthonormal_weight() for head in self.projection_heads
+                head.effective_weight() for head in self.projection_heads
             ],
             "self_expression": self_expression,
             "coefficients": [item["coefficients"] for item in self_expression],
@@ -463,11 +477,11 @@ class LossWeightsForAugmentation:
     # weight lets clustering reorganize the shared representation.
     reconstruction: float = 1.0
     self_expression: float = 0.2
-    coefficient_regularization: float = 0.002
+    coefficient_regularization: float = 0.02
     stability: float = 0.05
     augmentation_consistency: float = 0.2 # 0.1#0.05
     independence: float = 0.2 #0.02 # 0.02
-    projection_orthogonality: float = 0.01
+    projection_orthogonality: float = 0.001#0.01
     projection_overlap: float = 0.005 # 0.05
     beta_entropy: float = 0.01
     beta_mass_balance: float = 0.2
@@ -1042,9 +1056,9 @@ def differentiable_normalized_cut_losses(
 
     cut_per_view: list[Tensor] = []
     orthogonality_per_view: list[Tensor] = []
-    for affinity, assignment, cluster_count in zip(
+    for view_index, (affinity, assignment, cluster_count) in enumerate(zip(
         affinities, soft_assignments, n_clusters
-    ):
+    )):
         sample_count = affinity.shape[0]
         if affinity.ndim != 2 or affinity.shape != (sample_count, sample_count):
             raise ValueError("Every affinity must be a square matrix.")
@@ -1052,15 +1066,47 @@ def differentiable_normalized_cut_losses(
             raise ValueError(
                 "Every soft assignment must have shape [batch, cluster_count]."
             )
-        if not bool(torch.isfinite(affinity).all()) or not bool(
-            torch.isfinite(assignment).all()
+        affinity_is_finite = torch.isfinite(affinity)
+        assignment_is_finite = torch.isfinite(assignment)
+        if not bool(affinity_is_finite.all()) or not bool(
+            assignment_is_finite.all()
         ):
+            diagnostics: list[str] = []
+            for name, value, finite_mask in (
+                ("affinity", affinity, affinity_is_finite),
+                ("soft_assignment", assignment, assignment_is_finite),
+            ):
+                if bool(finite_mask.all()):
+                    continue
+                nan_count = int(torch.isnan(value).sum())
+                positive_inf_count = int((torch.isinf(value) & (value > 0)).sum())
+                negative_inf_count = int((torch.isinf(value) & (value < 0)).sum())
+                finite_values = value[finite_mask]
+                finite_abs_max = (
+                    float(finite_values.abs().amax())
+                    if finite_values.numel() > 0
+                    else float("nan")
+                )
+                diagnostics.append(
+                    f"{name}: nan={nan_count}, +inf={positive_inf_count}, "
+                    f"-inf={negative_inf_count}, finite_abs_max={finite_abs_max:.4g}"
+                )
             raise FloatingPointError(
-                "Normalized MinCut received NaN or Inf affinity/assignment values."
+                f"Normalized MinCut view {view_index} received non-finite values; "
+                + "; ".join(diagnostics)
             )
 
         affinity = 0.5 * (affinity + affinity.transpose(0, 1))
         affinity = affinity.clamp_min(0.0)
+        # MinCut is invariant to multiplying A by a positive scalar.  Scaling
+        # by a detached maximum prevents overflow in A @ P while preserving
+        # gradients with respect to the graph structure.
+        affinity_scale_floor = torch.finfo(affinity.dtype).tiny
+        affinity = affinity / affinity.amax().detach().clamp_min(
+            affinity_scale_floor
+        )
+        assignment = assignment.clamp_min(0.0)
+        assignment = assignment / assignment.sum(dim=1, keepdim=True).clamp_min(eps)
         degree = affinity.sum(dim=1)
 
         # tr(P^T A P), evaluated without constructing the K x K product.
@@ -1226,6 +1272,10 @@ def train_phase(
 
         for images, _ in loader:
             images = images.to(device)
+            if not bool(torch.isfinite(images).all()):
+                raise FloatingPointError(
+                    "The input batch contains NaN or Inf values before the model."
+                )
             left = (images + noise_std * torch.randn_like(images)).clamp(0, 1)
             right = (images + noise_std * torch.randn_like(images)).clamp(0, 1)
             optimizer.zero_grad(set_to_none=True)
@@ -1263,8 +1313,21 @@ def train_phase(
                     minimum_effective_dimensions=minimum_effective_dimensions,
                     augmented=(model(left), model(right)),
                 )
+            if not bool(torch.isfinite(total)):
+                nonfinite_terms = [
+                    name for name, value in terms.items()
+                    if not bool(torch.isfinite(value))
+                ]
+                raise FloatingPointError(
+                    "The total loss became non-finite. Non-finite terms: "
+                    + ", ".join(nonfinite_terms)
+                )
             total.backward()
-            torch.nn.utils.clip_grad_norm_(parameters, 5.0)
+            torch.nn.utils.clip_grad_norm_(
+                parameters,
+                5.0,
+                error_if_nonfinite=True,
+            )
             optimizer.step()
             batch_size = images.shape[0]
             sums["total"] += float(total.detach()) * batch_size
@@ -1720,8 +1783,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--joint-epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--pretrain-learning-rate", type=float, default=1e-4)
-    parser.add_argument("--view-learning-rate", type=float, default=1e-4)
-    parser.add_argument("--joint-learning-rate", type=float, default=1e-4)
+    parser.add_argument("--view-learning-rate", type=float, default=5e-5)
+    parser.add_argument("--joint-learning-rate", type=float, default=5e-5)
     parser.add_argument("--noise-std", type=float, default=0.01)
     parser.add_argument(
         "--upper-lower-mask-split",
