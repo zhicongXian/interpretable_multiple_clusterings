@@ -1,14 +1,14 @@
-# In this v1 version, I will add the diversity regularization loss and minimizing normalized eigenmap
-
-r"""Generic deep self-expressive multiple-view clustering for images.
+r"""Generic differentiable k-means multiple-view clustering for images.
 
 This program contains no semantic view-specific preprocessing.  Every image is
 processed by one shared ResNet autoencoder.  An orthogonal latent rotation,
 learned beta masks, and semi-orthogonal projection heads discover an arbitrary
-user-defined number of non-redundant views.  Each projected view is trained
-with its own SENet-style neural coefficient generator.  The generated
-self-expression matrices are sparse, signed, and zero diagonal.  Final labels
-are obtained by spectral clustering of the learned full-view affinities.
+user-defined number of non-redundant views.  Each projected view is passed
+through a parameter-free differentiable k-means (DKM) layer following Cho et
+al., ICLR 2022 (https://arxiv.org/abs/2108.12659).  DKM alternates soft
+distance-based assignments with attention-weighted centroid updates.  Final
+labels are the hard argmax of the learned DKM assignments; no self-expression
+matrix or spectral clustering post-processing is used.
 
 Required NPZ arrays::
 
@@ -21,7 +21,7 @@ ACC/NMI/ARI evaluation.  They are never supplied to the optimizer.
 
 Example::
 
-    python generic_self_expressive_multiview_clustering.py \
+    python generic_self_expressive_multiview_clustering_senet_style.py \
         --dataset dataset.npz \
         --clusters 3,3,4 \
         --view-names view_1,view_2,view_3 \
@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import argparse
 import itertools
-import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -76,183 +75,146 @@ def _limited(dataset: Dataset[Any], maximum: int | None, seed: int) -> Dataset[A
     return Subset(dataset, indices) # Subset of a dataset at specified indices.
 
 
-class SENetSelfExpression(nn.Module):
-    """Generate sparse signed self-expression coefficients from embeddings.
+class DifferentiableKMeans(nn.Module):
+    """Parameter-free, unrolled differentiable k-means (DKM) layer.
 
-    For samples ``z_i`` and ``z_j``, this module implements
+    Given samples ``Z`` and centroids ``C``, one iteration computes
 
-    ``C_ij = alpha * T_b(cos(q(z_i), k(z_j)) / temperature)``,
+    ``A = softmax(-||z_i - c_j||^2 / temperature)``
 
-    where ``q`` and ``k`` are learned MLPs and ``T_b`` is signed soft
-    thresholding.  The diagonal is always zero.  Optionally retaining the
-    largest absolute ``n_neighbors`` scores makes the batch graph sparse
-    without imposing the convex-combination constraint of a row-wise softmax.
+    followed by ``C_j = sum_i A_ij z_i / sum_i A_ij``.  The loop is unrolled,
+    so gradients propagate through assignments and centroid updates.  As in
+    Cho et al. (ICLR 2022), the first call initializes centroids from randomly
+    selected inputs and subsequent batches start from the last cached
+    centroids.  The cache is a buffer, not a learnable parameter.
     """
 
     def __init__(
         self,
         input_dim: int,
+        n_clusters: int,
         *,
-        hidden_dim: int | None = None,
-        coefficient_dim: int | None = None,
         temperature: float = 1.0,
-        n_neighbors: int = 16,
-        initial_threshold: float = 0.1,
-        initial_coefficient_scale: float = 0.1,
-        elastic_net_l1_ratio: float = 0.9,
+        max_iterations: int = 5,
+        tolerance: float = 1e-4,
+        eps: float = 1e-8,
     ) -> None:
         super().__init__()
         if input_dim < 1:
-            raise ValueError("self-expression input_dim must be positive.")
-        if hidden_dim is not None and hidden_dim < 1:
-            raise ValueError("hidden_dim must be positive when provided.")
-        if coefficient_dim is not None and coefficient_dim < 1:
-            raise ValueError("coefficient_dim must be positive when provided.")
+            raise ValueError("DKM input_dim must be positive.")
+        if n_clusters < 2:
+            raise ValueError("DKM n_clusters must be at least two.")
         if temperature <= 0:
-            raise ValueError("self-expression temperature must be positive.")
-        if n_neighbors < 1:
-            raise ValueError("self-expression n_neighbors must be positive.")
-        if initial_threshold <= 0:
-            raise ValueError("initial_threshold must be positive.")
-        if initial_coefficient_scale <= 0:
-            raise ValueError("initial_coefficient_scale must be positive.")
-        if not 0.0 <= elastic_net_l1_ratio <= 1.0:
-            raise ValueError("elastic_net_l1_ratio must lie in [0, 1].")
+            raise ValueError("DKM temperature must be positive.")
+        if max_iterations < 1:
+            raise ValueError("DKM max_iterations must be positive.")
+        if tolerance < 0:
+            raise ValueError("DKM tolerance must be nonnegative.")
+        if eps <= 0:
+            raise ValueError("DKM eps must be positive.")
 
         self.input_dim = int(input_dim)
-        self.hidden_dim = int(hidden_dim or max(32, input_dim))
-        self.coefficient_dim = int(coefficient_dim or input_dim)
+        self.n_clusters = int(n_clusters)
         self.temperature = float(temperature)
-        self.n_neighbors = int(n_neighbors)
-        self.elastic_net_l1_ratio = float(elastic_net_l1_ratio)
+        self.max_iterations = int(max_iterations)
+        self.tolerance = float(tolerance)
+        self.eps = float(eps)
+        self.register_buffer(
+            "centroids", torch.zeros(self.n_clusters, self.input_dim)
+        ) # here register the variables
+        self.register_buffer("centroids_initialized", torch.tensor(False))
 
-        def make_pair_network() -> nn.Sequential:
-            return nn.Sequential(
-                nn.Linear(self.input_dim, self.hidden_dim),
-                nn.ReLU(inplace=True),
-                nn.Linear(self.hidden_dim, self.coefficient_dim),
+    @torch.no_grad()
+    def reset_centroids(self) -> None:
+        self.centroids.zero_()
+        self.centroids_initialized.fill_(False)
+
+    @torch.no_grad()
+    def _initialize_centroids(self, latent: Tensor) -> Tensor:
+        sample_count = latent.shape[0]
+        if sample_count < self.n_clusters:
+            raise ValueError(
+                f"DKM needs at least {self.n_clusters} samples, got "
+                f"{sample_count}. Increase the batch size or reduce clusters."
             )
+        indices = torch.randperm(sample_count, device=latent.device)[
+            : self.n_clusters
+        ]
+        return latent[indices].detach().clone()
 
-        self.query_network = make_pair_network()
-        self.key_network = make_pair_network()
-        # Identical initialization starts from a learned-metric similarity
-        # graph; q and k are then free to specialize independently.
-        self.key_network.load_state_dict(self.query_network.state_dict())
-
-        self.raw_threshold = nn.Parameter(
-            torch.tensor(self._inverse_softplus(initial_threshold))
-        )
-        self.raw_coefficient_scale = nn.Parameter(
-            torch.tensor(self._inverse_softplus(initial_coefficient_scale))
-        )
-
-    @staticmethod
-    def _inverse_softplus(value: float) -> float:
-        return math.log(math.expm1(value))
-
-    @property
-    def threshold(self) -> Tensor:
-        return F.softplus(self.raw_threshold).clamp_min(1e-8)
-
-    @property
-    def coefficient_scale(self) -> Tensor:
-        return F.softplus(self.raw_coefficient_scale).clamp_min(1e-8)
-
-    def pair_embeddings(self, latent: Tensor) -> tuple[Tensor, Tensor]:
-        """Return normalized learned query and key embeddings."""
-
-        query = F.normalize(self.query_network(latent), dim=1, eps=1e-8)
-        key = F.normalize(self.key_network(latent), dim=1, eps=1e-8)
-        return query, key
-
-    def coefficient_matrix(
-        self,
-        query: Tensor,
-        key: Tensor,
-        *,
-        n_neighbors: int | None = None,
-    ) -> Tensor:
-        """Construct ``C`` from precomputed query and key embeddings."""
-
-        if query.ndim != 2 or key.ndim != 2 or query.shape != key.shape:
-            raise ValueError("query and key must be equally shaped matrices.")
-        sample_count = query.shape[0]
-        if sample_count < 1:
-            raise ValueError("Self-expression received an empty batch.")
-        if sample_count == 1:
-            return query.new_zeros((1, 1))
-
-        scores = (query @ key.transpose(0, 1)) / self.temperature
-        diagonal = torch.eye(
-            sample_count, dtype=torch.bool, device=scores.device
-        )
-        scores = scores.masked_fill(diagonal, 0.0)
-
-        requested_neighbors = self.n_neighbors if n_neighbors is None else n_neighbors
-        if requested_neighbors < 1:
-            raise ValueError("n_neighbors must be positive.")
-        neighbor_count = min(int(requested_neighbors), sample_count - 1)
-        support = ~diagonal
-        if neighbor_count < sample_count - 1:
-            ranking_scores = scores.abs().masked_fill(diagonal, float("-inf"))
-            indices = torch.topk(
-                ranking_scores, k=neighbor_count, dim=1
-            ).indices
-            support = torch.zeros_like(diagonal)
-            support.scatter_(1, indices, True)
-
-        threshold = self.threshold.to(device=scores.device, dtype=scores.dtype)
-        scale = self.coefficient_scale.to(
-            device=scores.device, dtype=scores.dtype
-        )
-        coefficients = scale * scores.sign() * F.relu(scores.abs() - threshold)
-        coefficients = coefficients.masked_fill(~support, 0.0)
-        coefficients = coefficients.masked_fill(diagonal, 0.0)
-        return coefficients
-
-    @staticmethod
-    def affinity_from_coefficients(coefficients: Tensor) -> Tensor:
-        """Create the nonnegative symmetric affinity used by spectral clustering."""
-
-        affinity = 0.5 * (
-            coefficients.abs() + coefficients.transpose(0, 1).abs()
-        )
-        diagonal = torch.eye(
-            coefficients.shape[0],
-            dtype=torch.bool,
-            device=coefficients.device,
-        )
-        return affinity.masked_fill(diagonal, 0.0)
-
-    def elastic_net_regularization(self, coefficients: Tensor) -> Tensor:
-        """Batch-size-stable elastic-net penalty for generated coefficients."""
-
-        if coefficients.shape[0] <= 1:
-            return coefficients.new_zeros(())
-        neighbor_count = min(self.n_neighbors, coefficients.shape[1] - 1)
-        normalizer = float(max(neighbor_count, 1))
-        l1 = coefficients.abs().sum(dim=1).mean() / normalizer
-        l2 = coefficients.square().sum(dim=1).mean() / normalizer
-        ratio = self.elastic_net_l1_ratio
-        return ratio * l1 + 0.5 * (1.0 - ratio) * l2
+    def _assign(self, latent: Tensor, centroids: Tensor) -> tuple[Tensor, Tensor]:
+        # Squared Euclidean distance is the k-means metric and corresponds to
+        # the Gaussian/EM interpretation in Appendix G of the DKM paper.
+        distances_squared = torch.cdist(latent, centroids, p=2).square()
+        assignments = F.softmax(-distances_squared / self.temperature, dim=1)
+        return assignments, distances_squared
 
     def forward(
         self,
         latent: Tensor,
         *,
-        n_neighbors: int | None = None,
+        update_state: bool = True,
     ) -> dict[str, Tensor]:
-        query, key = self.pair_embeddings(latent)
-        coefficients = self.coefficient_matrix(
-            query, key, n_neighbors=n_neighbors
-        )
+        if latent.ndim != 2 or latent.shape[1] != self.input_dim:
+            raise ValueError(
+                f"DKM expected [N, {self.input_dim}], got {tuple(latent.shape)}."
+            )
+        if latent.shape[0] < self.n_clusters and not bool(
+            self.centroids_initialized
+        ):
+            raise ValueError(
+                f"DKM needs at least {self.n_clusters} samples for first-call "
+                f"initialization, got {latent.shape[0]}."
+            )
+
+        if bool(self.centroids_initialized):
+            centroids = self.centroids.to(dtype=latent.dtype).clone()
+        else:
+            centroids = self._initialize_centroids(latent)
+
+        iterations = 0
+        centroid_shift = latent.new_zeros(())
+        # A final short minibatch can still be assigned using the cached
+        # centroids, but it should not redefine K centroids from fewer than K
+        # observations.
+        if latent.shape[0] >= self.n_clusters:
+            centroid_shift = latent.new_tensor(float("inf"))
+            for iteration in range(self.max_iterations):
+                assignments, _ = self._assign(latent, centroids)
+                cluster_mass = assignments.sum(dim=0)
+                candidates = (
+                    assignments.transpose(0, 1) @ latent
+                ) / cluster_mass.clamp_min(self.eps).unsqueeze(1)
+                nonempty = cluster_mass > self.eps
+                candidates = torch.where(
+                    nonempty.unsqueeze(1), candidates, centroids
+                )
+                centroid_shift = (candidates - centroids).abs().amax()
+                centroids = candidates
+                iterations = iteration + 1
+                if float(centroid_shift.detach()) <= self.tolerance:
+                    break
+
+        assignments, distances_squared = self._assign(latent, centroids)
+        quantized_latent = assignments @ centroids
+        expected_distortion = (
+            assignments * distances_squared
+        ).sum(dim=1).mean()
+
+        if update_state and latent.shape[0] >= self.n_clusters:
+            with torch.no_grad():
+                self.centroids.copy_(centroids.detach().to(self.centroids.dtype))
+                self.centroids_initialized.fill_(True)
+
         return {
-            "coefficients": coefficients,
-            "affinity": self.affinity_from_coefficients(coefficients),
-            "reconstructed_latent": coefficients @ latent,
-            "elastic_net": self.elastic_net_regularization(coefficients),
-            "query": query,
-            "key": key,
+            "assignments": assignments,
+            "centroids": centroids,
+            "quantized_latent": quantized_latent,
+            "distances_squared": distances_squared,
+            "expected_distortion": expected_distortion,
+            "hard_labels": assignments.argmax(dim=1),
+            "iterations": latent.new_tensor(iterations),
+            "centroid_shift": centroid_shift,
         }
 
 class SemiOrthogonalProjectionHead(nn.Module):
@@ -284,8 +246,8 @@ class SemiOrthogonalProjectionHead(nn.Module):
         else:
             return F.linear(weighted, self.weight_raw)
 
-class GenericSelfExpressiveMultiView(nn.Module):
-    """Shared nonlinear representation with learned generic latent views."""
+class GenericDifferentiableKMeansMultiView(nn.Module):
+    """Shared nonlinear representation with one DKM layer per latent view."""
 
     def __init__(
         self,
@@ -298,13 +260,9 @@ class GenericSelfExpressiveMultiView(nn.Module):
         encoder_channels: Sequence[int] = (16, 32, 64),
         encoder_blocks: Sequence[int] = (1, 1, 1),
         decoder_channels: Sequence[int] = (64, 32, 16, 8),
-        self_expression_temperature: float = 1.0,
-        self_expression_neighbors: int = 16,
-        self_expression_hidden_dim: int | None = None,
-        self_expression_coefficient_dim: int | None = None,
-        self_expression_threshold: float = 0.1,
-        self_expression_coefficient_scale: float = 0.1,
-        elastic_net_l1_ratio: float = 0.9,
+        dkm_temperature: float = 1.0,
+        dkm_max_iterations: int = 5,
+        dkm_tolerance: float = 1e-4,
     ) -> None:
         super().__init__()
         self.image_shape = tuple(int(value) for value in image_shape)
@@ -352,19 +310,16 @@ class GenericSelfExpressiveMultiView(nn.Module):
                 for _ in range(self.n_views)
             ]
         )
-        self.self_expression_heads = nn.ModuleList(
+        self.dkm_heads = nn.ModuleList(
             [
-                SENetSelfExpression(
+                DifferentiableKMeans(
                     self.projection_dim,
-                    hidden_dim=self_expression_hidden_dim,
-                    coefficient_dim=self_expression_coefficient_dim,
-                    temperature=self_expression_temperature,
-                    n_neighbors=self_expression_neighbors,
-                    initial_threshold=self_expression_threshold,
-                    initial_coefficient_scale=self_expression_coefficient_scale,
-                    elastic_net_l1_ratio=elastic_net_l1_ratio,
+                    cluster_count,
+                    temperature=dkm_temperature,
+                    max_iterations=dkm_max_iterations,
+                    tolerance=dkm_tolerance,
                 )
-                for _ in range(self.n_views)
+                for cluster_count in self.n_clusters
             ]
         )
 
@@ -396,14 +351,19 @@ class GenericSelfExpressiveMultiView(nn.Module):
     def autoencode(self, images: Tensor) -> Tensor:
         return self.decoder(self.encoder(images))
 
-    def forward(self, images: Tensor) -> dict[str, Any]:
+    def forward(
+        self,
+        images: Tensor,
+        *,
+        update_dkm_state: bool = True,
+    ) -> dict[str, Any]:
         shared, rotated, rotation = self.encode_rotated(images)
         reconstruction = self.decoder(shared)
         beta = self.beta()
         projected_views = self.project_views(rotated, beta)
-        self_expression = [
-            head(projected)
-            for head, projected in zip(self.self_expression_heads, projected_views)
+        dkm = [
+            head(projected, update_state=update_dkm_state)
+            for head, projected in zip(self.dkm_heads, projected_views)
         ]
         return {
             "shared": shared,
@@ -415,9 +375,10 @@ class GenericSelfExpressiveMultiView(nn.Module):
             "projection_weights": [
                 head.orthonormal_weight() for head in self.projection_heads
             ],
-            "self_expression": self_expression,
-            "coefficients": [item["coefficients"] for item in self_expression],
-            "affinities": [item["affinity"] for item in self_expression],
+            "dkm": dkm,
+            "assignments": [item["assignments"] for item in dkm],
+            "centroids": [item["centroids"] for item in dkm],
+            "quantized_views": [item["quantized_latent"] for item in dkm],
         }
 
 @dataclass # (frozen=True)
@@ -425,9 +386,7 @@ class LossWeightsForAugmentation:
     # Reconstruction is already optimized during pretraining. A smaller joint
     # weight lets clustering reorganize the shared representation.
     reconstruction: float = 1.0
-    self_expression: float = 0.2
-    cluster_structure: float = 0.1
-    coefficient_regularization: float = 0.002
+    kmeans: float = 0.2
     stability: float = 0.05
     augmentation_consistency: float = 0.2 # 0.1#0.05
     independence: float = 0.2 #0.02 # 0.02
@@ -438,13 +397,11 @@ class LossWeightsForAugmentation:
     beta_effective_dimension: float = 0.0 #0.05
     latent_variance: float = 0.05
     worst_view_temperature: float = 0.1
-    embedding_diversity: float = 0.0 # 0.00002
-    spectral_separation: float = 0.0 #  0.2
+    embedding_diversity: float = 0.0
 @dataclass # (frozen=True)
 class LossWeights:
     reconstruction: float = 1.0
-    self_expression: float = 0.2
-    coefficient_regularization: float = 0.02
+    kmeans: float = 0.2
     stability: float = 0.05
     independence: float = 0.05
     projection_overlap: float = 0.02
@@ -453,7 +410,7 @@ class LossWeights:
     beta_effective_dimension: float = 0.0 #0.05
     latent_variance: float = 0.05
     worst_view_temperature: float = 0.1
-    embedding_diversity: float = 0.0 # 0.00002
+    embedding_diversity: float = 0.0
 
 
 def _pairwise_hsic(values: Sequence[Tensor]) -> Tensor:
@@ -525,13 +482,14 @@ def _maximize_latent_diversity(values: Tensor, eps = 1.0) -> Tensor:
     total_coding_rate = TotalCodingRate(eps=eps)
     return total_coding_rate(values, values)
 
-def _pairwise_hsic_projected_view(values: Sequence[Tensor], eps = 1.0 ) -> Tensor:
+def _pairwise_soft_nmi(values: Sequence[Tensor]) -> Tensor:
+    """Dependence between soft DKM assignments from different views."""
+
     if len(values) < 2:
         return values[0].new_zeros(())
-    total_coding_rate = TotalCodingRate(eps=eps)
     return torch.stack(
         [
-            soft_nmi(left, right) # total_coding_rate(left, right)
+            soft_nmi(left, right, from_logits=False)
             for left, right in itertools.combinations(values, 2)
         ]
     ).mean()
@@ -614,17 +572,8 @@ def multiview_loss(
     minimum_effective_dimensions: float,
     augmented: tuple[dict[str, Any], dict[str, Any]] | None = None,
 ) -> tuple[Tensor, dict[str, Tensor]]:
-    self_expression = smooth_worst_view(
-        [
-            F.mse_loss(item["reconstructed_latent"], latent)
-            for item, latent in zip(
-                outputs["self_expression"], outputs["projected_views"]
-            )
-        ],
-        weights.worst_view_temperature,
-    )
-    coefficient_regularization = smooth_worst_view(
-        [item["elastic_net"] for item in outputs["self_expression"]],
+    kmeans = smooth_worst_view(
+        [item["expected_distortion"] for item in outputs["dkm"]],
         weights.worst_view_temperature,
     )
     stability = (
@@ -632,7 +581,7 @@ def multiview_loss(
             [
                 F.mse_loss(left, right)
                 for left, right in zip(
-                    augmented[0]["coefficients"], augmented[1]["coefficients"]
+                    augmented[0]["assignments"], augmented[1]["assignments"]
                 )
             ],
             weights.worst_view_temperature,
@@ -651,13 +600,11 @@ def multiview_loss(
     )
     independence = 0.5 * (
         _pairwise_hsic(outputs["projected_views"])
-        + _pairwise_hsic_projected_view(outputs["affinities"])#_pairwise_hsic(outputs["affinities"])
+        + _pairwise_soft_nmi(outputs["assignments"])
     )
-    maximize_latent_diversity = _maximize_latent_diversity(outputs["shared"])
     terms = {
         "reconstruction": F.mse_loss(outputs["reconstruction"], images),
-        "self_expression": self_expression,
-        "coefficient_regularization": coefficient_regularization,
+        "kmeans": kmeans,
         "stability": stability,
         "independence": independence,
         "projection_overlap": semi_orthogonal_overlap_loss(
@@ -669,7 +616,9 @@ def multiview_loss(
             outputs["beta"], minimum_effective_dimensions
         ),
         "latent_variance": latent_variance,
-        "embedding_diversity":  maximize_latent_diversity
+        # Kept as an explicit zero-valued diagnostic to guarantee that this
+        # objective is disabled in every training phase.
+        "embedding_diversity": images.new_zeros(()),
     }
     total = sum(getattr(weights, name) * value for name, value in terms.items())
     return total, terms
@@ -686,7 +635,7 @@ def _make_writer(path: Path | None) -> Any | None:
 
 
 def pretrain_autoencoder(
-    model: GenericSelfExpressiveMultiView,
+    model: GenericDifferentiableKMeansMultiView,
     loader: DataLoader,
     *,
     epochs: int,
@@ -733,7 +682,9 @@ def pretrain_autoencoder(
     return history
 
 
-def _configure_phase(model: GenericSelfExpressiveMultiView, phase: str) -> None:
+def _configure_phase(
+    model: GenericDifferentiableKMeansMultiView, phase: str
+) -> None:
     if phase not in {"view", "joint"}:
         raise ValueError(f"Unknown phase: {phase}")
     train_shared = phase == "joint"
@@ -746,9 +697,7 @@ def _configure_phase(model: GenericSelfExpressiveMultiView, phase: str) -> None:
     for head in model.projection_heads:
         for parameter in head.parameters():
             parameter.requires_grad_(True)
-    for head in model.self_expression_heads:
-        for parameter in head.parameters():
-            parameter.requires_grad_(True)
+    # DKM heads contain only cached centroid buffers and no parameters.
 
 ######## 1. for view training add the constrastive loss ########
 
@@ -901,7 +850,7 @@ def augment_for_view(
 
 
 def view_specific_augmented_outputs(
-    model: GenericSelfExpressiveMultiView,
+    model: GenericDifferentiableKMeansMultiView,
     images: Tensor,
     roles: Sequence[str],
     *,
@@ -935,27 +884,27 @@ def view_specific_augmented_outputs(
 
     left_projected: list[Tensor] = []
     right_projected: list[Tensor] = []
-    left_coefficients: list[Tensor] = []
-    right_coefficients: list[Tensor] = []
+    left_assignments: list[Tensor] = []
+    right_assignments: list[Tensor] = []
     view_count = len(roles)
-    for view, head in enumerate(model.self_expression_heads):
+    for view, head in enumerate(model.dkm_heads):
         left_start = view * batch_size
         right_start = (view_count + view) * batch_size
         left = all_projected[view][left_start : left_start + batch_size]
         right = all_projected[view][right_start : right_start + batch_size]
         left_projected.append(left)
         right_projected.append(right)
-        left_coefficients.append(head(left)["coefficients"])
-        right_coefficients.append(head(right)["coefficients"])
+        left_assignments.append(head(left, update_state=False)["assignments"])
+        right_assignments.append(head(right, update_state=False)["assignments"])
 
     return (
         {
             "projected_views": left_projected,
-            "coefficients": left_coefficients,
+            "assignments": left_assignments,
         },
         {
             "projected_views": right_projected,
-            "coefficients": right_coefficients,
+            "assignments": right_assignments,
         },
     )
 
@@ -971,58 +920,6 @@ def semi_orthogonality_loss(projection_weights: Sequence[Tensor]) -> Tensor:
         penalties.append(gram_error.square().mean())
     return torch.stack(penalties).mean()
 
-def spectral_cluster_separation_loss(
-    affinities: Sequence[Tensor],
-    n_clusters: Sequence[int],
-    *,
-    eigengap_margin: float,
-    worst_view_temperature: float,
-    eps: float = 1e-8,
-) -> Tensor:
-    """Encourage exactly ``K_v`` graph components in every view.
-
-    For the normalized Laplacian, the first ``K_v`` eigenvalues are pushed
-    towards zero, while eigenvalue ``K_v + 1`` is kept above a margin. Batches
-    with no ``K_v + 1`` eigenvalue are skipped for this term.
-    """
-
-    per_view: list[Tensor] = []
-    for affinity, cluster_count in zip(affinities, n_clusters):
-        sample_count = affinity.shape[0]
-        if sample_count <= cluster_count:
-            per_view.append(affinity.new_zeros(()))
-            continue
-
-        affinity = 0.5 * (affinity + affinity.transpose(0, 1))
-        degree = affinity.sum(dim=1).clamp_min(eps)
-        inverse_sqrt_degree = degree.rsqrt()
-        normalized_affinity = (
-            inverse_sqrt_degree[:, None]
-            * affinity
-            * inverse_sqrt_degree[None, :]
-        )
-        identity = torch.eye(
-            sample_count, device=affinity.device, dtype=affinity.dtype
-        )
-        laplacian = identity - normalized_affinity
-        laplacian = 0.5 * (laplacian + laplacian.transpose(0, 1))
-        original_dtype = laplacian.dtype
-
-        with torch.no_grad():
-            laplacian = laplacian.to(torch.float64)
-            scale = laplacian.abs().amax().detach().clamp_min(1.0)
-            laplacian = laplacian / scale
-            laplacian = laplacian + 1e-8*identity
-
-            eigenvalues = torch.linalg.eigvalsh(laplacian).clamp_min(0.0)
-
-        small_eigenvalues = eigenvalues[:cluster_count].square().mean()
-        next_eigenvalue = eigenvalues[cluster_count]
-        eigengap = F.relu(eigengap_margin - next_eigenvalue).square()
-        per_view.append(small_eigenvalues + eigengap)
-    res = smooth_worst_view(per_view, worst_view_temperature)
-    return res
-
 def multiview_loss_with_augmentation(
     images: Tensor,
     outputs: dict[str, Any],
@@ -1031,21 +928,11 @@ def multiview_loss_with_augmentation(
     n_clusters: Sequence[int],
     minimum_effective_dimensions: float,
     augmented: tuple[dict[str, Any], dict[str, Any]] | None = None,
-eigengap_margin: float
 ) -> tuple[Tensor, dict[str, Tensor]]:
-    if len(n_clusters) != len(outputs["affinities"]):
+    if len(n_clusters) != len(outputs["assignments"]):
         raise ValueError("Provide one cluster count for every projected view.")
-    self_expression = smooth_worst_view(
-        [
-            F.mse_loss(item["reconstructed_latent"], latent)
-            for item, latent in zip(
-                outputs["self_expression"], outputs["projected_views"]
-            )
-        ],
-        weights.worst_view_temperature,
-    )
-    coefficient_regularization = smooth_worst_view(
-        [item["elastic_net"] for item in outputs["self_expression"]],
+    kmeans = smooth_worst_view(
+        [item["expected_distortion"] for item in outputs["dkm"]],
         weights.worst_view_temperature,
     )
     stability = (
@@ -1053,7 +940,7 @@ eigengap_margin: float
             [
                 F.mse_loss(left, right)
                 for left, right in zip(
-                    augmented[0]["coefficients"], augmented[1]["coefficients"]
+                    augmented[0]["assignments"], augmented[1]["assignments"]
                 )
             ],
             weights.worst_view_temperature,
@@ -1084,30 +971,13 @@ eigengap_margin: float
         ],
         weights.worst_view_temperature,
     )
-    # cluster_structure = smooth_worst_view(
-    #     [
-    #         spectral_cluster_structure_loss(affinity, cluster_count)
-    #         for affinity, cluster_count in zip(outputs["affinities"], n_clusters)
-    #     ],
-    #     weights.worst_view_temperature,
-    # )
-
-    spectral_separation= spectral_cluster_separation_loss(
-        outputs["affinities"],
-        n_clusters,
-        eigengap_margin=eigengap_margin,
-        worst_view_temperature=weights.worst_view_temperature,
-    ),
     independence = 0.5 * (
         _pairwise_hsic(outputs["projected_views"])
-        + _pairwise_hsic(outputs["affinities"])
+        + _pairwise_soft_nmi(outputs["assignments"])
     )
-
-    maximize_latent_diversity = _maximize_latent_diversity(outputs["shared"])
     terms = {
         "reconstruction": F.mse_loss(outputs["reconstruction"], images),
-        "self_expression": self_expression,
-        "coefficient_regularization": coefficient_regularization,
+        "kmeans": kmeans,
         "stability": stability,
         "augmentation_consistency": augmentation_consistency,
         "independence": independence,
@@ -1116,26 +986,20 @@ eigengap_margin: float
         ),
         "projection_overlap": semi_orthogonal_overlap_loss(
             outputs["projection_weights"]
-        ), # Not so sure whether this is necessary
-        "spectral_separation": spectral_cluster_separation_loss(
-        outputs["affinities"],
-        n_clusters,
-        eigengap_margin=eigengap_margin,
-        worst_view_temperature=weights.worst_view_temperature,
-    ),
+        ),
         "beta_entropy": beta_entropy(outputs["beta"]),
         "beta_mass_balance": beta_mass_balance_loss(outputs["beta"]),
         "beta_effective_dimension": beta_effective_dimension_loss(
             outputs["beta"], minimum_effective_dimensions
         ),
         "latent_variance": latent_variance,
-        "embedding_diversity": maximize_latent_diversity
+        "embedding_diversity": images.new_zeros(()),
     }
     total = sum(getattr(weights, name) * value for name, value in terms.items())
     return total, terms
 
 def train_phase(
-    model: GenericSelfExpressiveMultiView,
+    model: GenericDifferentiableKMeansMultiView,
     loader: DataLoader,
     *,
     phase: str,
@@ -1151,7 +1015,6 @@ def train_phase(
     color_shuffle_strength = 0.6,
     upper_lower_mask_split: float = 0.5,
     upper_lower_mask_strength: float = 1.0,
-    eigengap_margin: float = 0.1,
 ) -> list[dict[str, float]]:
     _configure_phase(model, phase)
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
@@ -1164,13 +1027,6 @@ def train_phase(
         model.train()
         sums: dict[str, float] = {"total": 0.0}
         count = 0
-        # This term stays disabled in every phase. View independence is already
-        # enforced explicitly; dispersing the shared embedding is not needed.
-        if phase=="view":
-            weights.embedding_diversity = 0.01
-        else:
-            weights.embedding_diversity = 0.0
-
         for images, _ in loader:
             images = images.to(device)
             left = (images + noise_std * torch.randn_like(images)).clamp(0, 1)
@@ -1181,7 +1037,10 @@ def train_phase(
                 if augmentation_roles is None:
                     left = (images + noise_std * torch.randn_like(images)).clamp(0, 1)
                     right = (images + noise_std * torch.randn_like(images)).clamp(0, 1)
-                    augmented = (model(left), model(right))
+                    augmented = (
+                        model(left, update_dkm_state=False),
+                        model(right, update_dkm_state=False),
+                    )
                 else:
                     augmented = view_specific_augmented_outputs(
                         model,
@@ -1201,7 +1060,6 @@ def train_phase(
                     n_clusters=model.n_clusters,
                     minimum_effective_dimensions=minimum_effective_dimensions,
                     augmented=augmented,
-                    eigengap_margin=eigengap_margin
                 )
             else:
                 total, terms = multiview_loss(
@@ -1209,7 +1067,10 @@ def train_phase(
                     outputs,
                     weights=weights,
                     minimum_effective_dimensions=minimum_effective_dimensions,
-                    augmented=(model(left), model(right)),
+                    augmented=(
+                        model(left, update_dkm_state=False),
+                        model(right, update_dkm_state=False),
+                    ),
                 )
             total.backward()
             torch.nn.utils.clip_grad_norm_(parameters, 5.0)
@@ -1235,15 +1096,15 @@ def train_phase(
                     float(beta[view].mean()),
                     epoch,
                 )
-                self_expression_head = model.self_expression_heads[view]
+                dkm_head = model.dkm_heads[view]
                 writer.add_scalar(
-                    f"{phase}/self_expression_threshold/{name}",
-                    float(self_expression_head.threshold.detach()),
+                    f"{phase}/dkm_centroid_norm/{name}",
+                    float(dkm_head.centroids.norm().detach()),
                     epoch,
                 )
                 writer.add_scalar(
-                    f"{phase}/self_expression_scale/{name}",
-                    float(self_expression_head.coefficient_scale.detach()),
+                    f"{phase}/dkm_temperature/{name}",
+                    dkm_head.temperature,
                     epoch,
                 )
     _configure_phase(model, "joint")
@@ -1252,7 +1113,7 @@ def train_phase(
 
 @torch.no_grad()
 def collect_views_synthetic_shape_color(
-    model: GenericSelfExpressiveMultiView,
+    model: GenericDifferentiableKMeansMultiView,
     loader: DataLoader,
     device: torch.device,
 ) -> tuple[list[Tensor], np.ndarray]:
@@ -1261,8 +1122,9 @@ def collect_views_synthetic_shape_color(
     batches: list[list[Tensor]] = [[] for _ in range(model.n_views)]
     index_batches: list[np.ndarray] = []
     for images, original_indices in loader:
-        outputs = model(images.to(device))
-        for view, latent in enumerate(outputs["projected_views"]):
+        _, rotated, _ = model.encode_rotated(images.to(device))
+        projected_views = model.project_views(rotated)
+        for view, latent in enumerate(projected_views):
             batches[view].append(latent.detach().cpu())
         index_batches.append(np.asarray(original_indices, dtype=np.int64))
     model.train(was_training)
@@ -1270,7 +1132,7 @@ def collect_views_synthetic_shape_color(
 
 @torch.no_grad()
 def collect_views_general(
-    model: GenericSelfExpressiveMultiView,
+    model: GenericDifferentiableKMeansMultiView,
     loader: DataLoader,
     device: torch.device,
 ) -> tuple[list[Tensor], np.ndarray]:
@@ -1279,8 +1141,9 @@ def collect_views_general(
     batches: list[list[Tensor]] = [[] for _ in range(model.n_views)]
     label_batches: list[np.ndarray] = []
     for images, labels in loader:
-        outputs = model(images.to(device))
-        for view, latent in enumerate(outputs["projected_views"]):
+        _, rotated, _ = model.encode_rotated(images.to(device))
+        projected_views = model.project_views(rotated)
+        for view, latent in enumerate(projected_views):
             batches[view].append(latent.detach().cpu())
         label_batches.append(np.asarray(labels, dtype=np.int64))
     model.train(was_training)
@@ -1288,35 +1151,20 @@ def collect_views_general(
 
 
 @torch.no_grad()
-def self_expression_affinity(
-    head: SENetSelfExpression,
+def dkm_predictions(
+    head: DifferentiableKMeans,
     latent: Tensor,
     *,
-    n_neighbors: int,
     device: torch.device,
-    transform_batch_size: int = 4096,
 ) -> np.ndarray:
-    if latent.ndim != 2 or latent.shape[0] < 2:
-        raise ValueError("Full-view self-expression requires at least two samples.")
-    if n_neighbors < 1 or transform_batch_size < 1:
-        raise ValueError("n_neighbors and transform_batch_size must be positive.")
+    """Run DKM on a complete projected view and return snapped assignments."""
 
-    # Only the small neural transformations are evaluated on the model device.
-    # The O(N^2) coefficient/affinity matrices stay on CPU, as in the previous
-    # full-dataset evaluation path, to avoid unnecessary GPU memory pressure.
-    query_batches: list[Tensor] = []
-    key_batches: list[Tensor] = []
-    for batch in latent.float().split(transform_batch_size):
-        query, key = head.pair_embeddings(batch.to(device))
-        query_batches.append(query.detach().cpu())
-        key_batches.append(key.detach().cpu())
-    query = torch.cat(query_batches, dim=0)
-    key = torch.cat(key_batches, dim=0)
-    coefficients = head.coefficient_matrix(
-        query, key, n_neighbors=n_neighbors
-    )
-    affinity = head.affinity_from_coefficients(coefficients)
-    return affinity.numpy()
+    if latent.ndim != 2 or latent.shape[0] < head.n_clusters:
+        raise ValueError(
+            "Full-view DKM needs a matrix with at least one sample per cluster."
+        )
+    result = head(latent.float().to(device), update_state=False)
+    return result["hard_labels"].detach().cpu().numpy()
 
 
 def _clustering_accuracy(labels: np.ndarray, predictions: np.ndarray) -> float:
@@ -1334,17 +1182,13 @@ def _clustering_accuracy(labels: np.ndarray, predictions: np.ndarray) -> float:
 
 @torch.no_grad()
 def evaluate_clustering(
-    model: GenericSelfExpressiveMultiView,
+    model: GenericDifferentiableKMeansMultiView,
     loader: DataLoader,
     dataset_path: str | Path,
     device: torch.device,
     dataset: str,
-    *,
-    n_neighbors: int,
-    random_state: int,
 ) -> dict[str, Any]:
     from scipy.optimize import linear_sum_assignment
-    from sklearn.cluster import SpectralClustering
     from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
     if dataset.lower() == "synthetic_shape_color":
         latents, original_indices = collect_views_synthetic_shape_color(model, loader, device)
@@ -1352,22 +1196,14 @@ def evaluate_clustering(
         latents, labels = collect_views_general(model, loader, device)
     predictions: list[np.ndarray] = []
     for view, latent in enumerate(latents):
-        affinity = self_expression_affinity(
-            model.self_expression_heads[view],
-            latent,
-            n_neighbors=n_neighbors,
-            device=device,
-        )
         predictions.append(
-            SpectralClustering(
-                n_clusters=model.n_clusters[view],
-                affinity="precomputed",
-                assign_labels="kmeans",
-                n_init=20,
-                random_state=random_state,
-            ).fit_predict(affinity)
+            dkm_predictions(
+                model.dkm_heads[view],
+                latent,
+                device=device,
+            )
         )
-    if args.dataset == "synthetic_shape_color":
+    if dataset.lower() == "synthetic_shape_color":
         archive = np.load(dataset_path, allow_pickle=False)
         label_keys = sorted(
             key
@@ -1388,9 +1224,9 @@ def evaluate_clustering(
             }
         facets = [key.removesuffix("_labels") for key in label_keys]
         labels = [np.asarray(archive[key])[original_indices] for key in label_keys]
-    elif args.dataset.lower() == "nr_objects":
+    elif dataset.lower() == "nr_objects":
         facets=["color", "material", "shape"] # material_objects_colors, i need to get the label information
-    elif args.dataset.lower() == "stickfigures":
+    elif dataset.lower() == "stickfigures":
         facets=["upper", "lower"]
 
     predictions=np.asarray(predictions)
@@ -1426,7 +1262,7 @@ def evaluate_clustering(
     column_width = max(11, max(len(name) for name in facets) + 2)
     for metric_name, matrix in (("ACC", acc), ("NMI", nmi), ("ARI", ari)):
         suffix = " (cluster IDs matched)" if metric_name == "ACC" else ""
-        print(f"\nTest spectral self-expression {metric_name}{suffix}:")
+        print(f"\nTest differentiable k-means {metric_name}{suffix}:")
         print(
             "discovered".ljust(name_width)
             + "".join(name.rjust(column_width) for name in facets)
@@ -1492,7 +1328,7 @@ def _rgb_image(tensor: Tensor) -> np.ndarray:
 
 
 def view_saliency(
-    model: GenericSelfExpressiveMultiView,
+    model: GenericDifferentiableKMeansMultiView,
     image: Tensor,
     view: int,
 ) -> Tensor:
@@ -1508,7 +1344,7 @@ def view_saliency(
 
 
 def visualize_views(
-    model: GenericSelfExpressiveMultiView,
+    model: GenericDifferentiableKMeansMultiView,
     image: Tensor,
     *,
     output_file: str | Path,
@@ -1613,18 +1449,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--encoder-blocks", type=_integer_tuple, default=(1, 1, 1))
     parser.add_argument("--decoder-channels", type=_integer_tuple, default=(64, 32, 16, 8))
     parser.add_argument(
-        "--temperature",
+        "--dkm-temperature",
         type=float,
         default=1.0,
-        help="Temperature applied to learned query-key similarities.",
+        help="Temperature for DKM soft distance-based assignments.",
     )
-    parser.add_argument("--self-expression-neighbors", type=int, default=16)
-    parser.add_argument("--senet-hidden-dim", type=int, default=None)
-    parser.add_argument("--senet-coefficient-dim", type=int, default=None)
-    parser.add_argument("--senet-threshold", type=float, default=0.1)
-    parser.add_argument("--senet-coefficient-scale", type=float, default=0.1)
-    parser.add_argument("--elastic-net-l1-ratio", type=float, default=0.9)
-    parser.add_argument("--spectral-neighbors", type=int, default=20)
+    parser.add_argument(
+        "--dkm-max-iterations",
+        type=int,
+        default=5,
+        help="Maximum unrolled centroid updates (the paper uses five).",
+    )
+    parser.add_argument(
+        "--dkm-tolerance",
+        type=float,
+        default=1e-4,
+        help="Stop DKM when the maximum centroid change is below this value.",
+    )
     parser.add_argument("--minimum-effective-dimensions", type=float, default=None)
     parser.add_argument("--pretrain-epochs", type=int, default=200)
     parser.add_argument("--view-epochs", type=int, default=300)
@@ -1650,13 +1491,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-test-samples", type=int, default=None)
     parser.add_argument("--sample-index", type=int, default=0)
-    parser.add_argument("--eigengap-margin", type=float, default=0.2)
     parser.add_argument("--experiment-name", type=str, default="v1")
     parser.add_argument(
-        "--visualization", type=Path, default=Path("generic_multiview_views_soft_nmi_aug.html")
+        "--visualization", type=Path, default=Path("generic_multiview_dkm_views.html")
     )
     parser.add_argument(
-        "--checkpoint", type=Path, default=Path("generic_multiview_model_aug.pt")
+        "--checkpoint", type=Path, default=Path("generic_multiview_dkm_model.pt")
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--cpu", action="store_true")
@@ -1707,6 +1547,8 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("Epoch counts must be nonnegative.")
     if args.view_names is not None and len(args.view_names) != len(args.clusters):
         raise ValueError("view-names and clusters must have the same length.")
+    if args.batch_size < max(args.clusters):
+        raise ValueError("batch-size must be at least the largest cluster count.")
     if not 0.0 < args.upper_lower_mask_split < 1.0:
         raise ValueError("upper-lower-mask-split must lie strictly between 0 and 1.")
     if not 0.0 <= args.upper_lower_mask_strength <= 1.0:
@@ -1740,7 +1582,7 @@ def run(args: argparse.Namespace) -> None:
         "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
     )
 
-    model = GenericSelfExpressiveMultiView(
+    model = GenericDifferentiableKMeansMultiView(
         sample_images.shape[1:],
         args.clusters,
         view_names=args.view_names,
@@ -1749,13 +1591,9 @@ def run(args: argparse.Namespace) -> None:
         encoder_channels=args.encoder_channels,
         encoder_blocks=args.encoder_blocks,
         decoder_channels=args.decoder_channels,
-        self_expression_temperature=args.temperature,
-        self_expression_neighbors=args.self_expression_neighbors,
-        self_expression_hidden_dim=args.senet_hidden_dim,
-        self_expression_coefficient_dim=args.senet_coefficient_dim,
-        self_expression_threshold=args.senet_threshold,
-        self_expression_coefficient_scale=args.senet_coefficient_scale,
-        elastic_net_l1_ratio=args.elastic_net_l1_ratio,
+        dkm_temperature=args.dkm_temperature,
+        dkm_max_iterations=args.dkm_max_iterations,
+        dkm_tolerance=args.dkm_tolerance,
     ).to(device)
     minimum_effective_dimensions = (
         float(args.minimum_effective_dimensions)
@@ -1806,8 +1644,6 @@ def run(args: argparse.Namespace) -> None:
             args.dataset_path,
             device,
             dataset = args.dataset,
-            n_neighbors=args.spectral_neighbors,
-            random_state=args.seed,
         )
         view_history = train_phase(
             model,
@@ -1823,7 +1659,6 @@ def run(args: argparse.Namespace) -> None:
             augmentation_roles=args.augmentation_roles,
             upper_lower_mask_split=args.upper_lower_mask_split,
             upper_lower_mask_strength=args.upper_lower_mask_strength,
-            eigengap_margin=args.eigengap_margin,
         )
         print("evaluation after VIEW TRAINING")
         test_metrics = evaluate_clustering(
@@ -1832,8 +1667,6 @@ def run(args: argparse.Namespace) -> None:
             args.dataset_path,
             device,
             dataset = args.dataset,
-            n_neighbors=args.spectral_neighbors,
-            random_state=args.seed,
         )
         joint_history = train_phase(
             model,
@@ -1849,7 +1682,6 @@ def run(args: argparse.Namespace) -> None:
             augmentation_roles=args.augmentation_roles,
             upper_lower_mask_split=args.upper_lower_mask_split,
             upper_lower_mask_strength=args.upper_lower_mask_strength,
-            eigengap_margin=args.eigengap_margin,
         )
         test_metrics = evaluate_clustering(
             model,
@@ -1857,8 +1689,6 @@ def run(args: argparse.Namespace) -> None:
             args.dataset_path,
             device,
             dataset = args.dataset,
-            n_neighbors=args.spectral_neighbors,
-            random_state=args.seed,
         )
         test_images, _ = next(iter(test_loader))
         if not 0 <= args.sample_index < len(test_images):
@@ -1897,10 +1727,10 @@ def inference(args: argparse.Namespace):
     )
 
     train_data = _limited(
-        NpzImageDataset(args.dataset, "train"), args.max_train_samples, args.seed
+        NpzImageDataset(args.dataset_path, "train"), args.max_train_samples, args.seed
     )
     test_data = _limited(
-        NpzImageDataset(args.dataset, "test"), args.max_test_samples, args.seed + 1
+        NpzImageDataset(args.dataset_path, "test"), args.max_test_samples, args.seed + 1
     )
     train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True)
     test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=False)
@@ -1908,7 +1738,7 @@ def inference(args: argparse.Namespace):
     device = torch.device(
         "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
     )
-    model = GenericSelfExpressiveMultiView(
+    model = GenericDifferentiableKMeansMultiView(
         sample_images.shape[1:],
         args.clusters,
         view_names=args.view_names,
@@ -1917,13 +1747,9 @@ def inference(args: argparse.Namespace):
         encoder_channels=args.encoder_channels,
         encoder_blocks=args.encoder_blocks,
         decoder_channels=args.decoder_channels,
-        self_expression_temperature=args.temperature,
-        self_expression_neighbors=args.self_expression_neighbors,
-        self_expression_hidden_dim=args.senet_hidden_dim,
-        self_expression_coefficient_dim=args.senet_coefficient_dim,
-        self_expression_threshold=args.senet_threshold,
-        self_expression_coefficient_scale=args.senet_coefficient_scale,
-        elastic_net_l1_ratio=args.elastic_net_l1_ratio,
+        dkm_temperature=args.dkm_temperature,
+        dkm_max_iterations=args.dkm_max_iterations,
+        dkm_tolerance=args.dkm_tolerance,
     ).to(device)
 
     model.load_state_dict(checkpoint["state_dict"], strict=True)
@@ -1935,8 +1761,6 @@ def inference(args: argparse.Namespace):
         args.dataset_path,
         device,
         dataset=args.dataset,
-        n_neighbors=args.spectral_neighbors,
-        random_state=args.seed,
         )
     test_images, _ = next(iter(test_loader))
     if not 0 <= args.sample_index < len(test_images):
