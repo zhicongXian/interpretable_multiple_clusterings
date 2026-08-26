@@ -430,8 +430,8 @@ class LossWeightsForAugmentation:
     coefficient_regularization: float = 0.002
     stability: float = 0.05
     augmentation_consistency: float = 0.2 # 0.1#0.05
-    independence: float = 0.02 #0.02 # 0.02
-    projection_orthogonality: float = 0.1
+    independence: float = 0.2 #0.02 # 0.02
+    projection_orthogonality: float = 0.01
     projection_overlap: float = 0.005 # 0.05
     beta_entropy: float = 0.01
     beta_mass_balance: float = 0.2

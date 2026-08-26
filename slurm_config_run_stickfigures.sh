@@ -23,12 +23,12 @@ export LAPACK=/usr/lib/x86_64-linux-gnu/lapack/liblapack.a
 python3 ./generic_self_expressive_multiview_clustering_senet_style.py --clusters=3,3 \
 --pretrain-epochs=5000 \
 --joint-epochs=1000 \
---view-epochs=1000 \
+--view-epochs=3000 \
 --checkpoint=./outputs/stickfigures_senet.pt \
 --visualization=./outputs/stickfigures_senet.html \
 --dataset=stickfigures \
---augmentation-roles=upper,lower\
---upper-lower-mask-strength=1.0 \
+--augmentation-roles=upper,lower  \
+--upper-lower-mask-strength=1.0  \
 --tensorboard-log-dir=./outputs/runs_stickfigures/ \
 --dataset-path=data/datasets/enrc_data/stickfigures >> ./outputs/deep_imc_stickfigures_out.txt
 
