@@ -98,6 +98,8 @@ class DifferentiableKMeans(nn.Module):
         max_iterations: int = 5,
         tolerance: float = 1e-4,
         eps: float = 1e-8,
+        random_state: int = 0,
+        n_init: int = 20
     ) -> None:
         super().__init__()
         if input_dim < 1:
@@ -123,6 +125,8 @@ class DifferentiableKMeans(nn.Module):
             "centroids", torch.zeros(self.n_clusters, self.input_dim)
         ) # here register the variables
         self.register_buffer("centroids_initialized", torch.tensor(False))
+        self.random_state = random_state
+        self.n_init = int(n_init)
 
     @torch.no_grad()
     def reset_centroids(self) -> None:
@@ -140,8 +144,28 @@ class DifferentiableKMeans(nn.Module):
         indices = torch.randperm(sample_count, device=latent.device)[
             : self.n_clusters
         ]
-        return latent[indices].detach().clone()
 
+        from sklearn.cluster import KMeans
+        kmeans = KMeans(
+            n_clusters=self.n_clusters,
+            init="k-means++",
+            n_init=self.n_init,
+            random_state=self.random_state,
+        )
+
+        centers = kmeans.fit(
+            latent.detach().float().cpu().numpy()
+        ).cluster_centers_
+        centers = torch.as_tensor(
+            centers,
+            device=self.centroids.device,
+            dtype=self.centroids.dtype,
+        )
+
+        self.centroids.copy_(centers)
+        self.centroids_initialized.fill_(True)
+        #return latent[indices].detach().clone()
+        return centers
     def _assign(self, latent: Tensor, centroids: Tensor) -> tuple[Tensor, Tensor]:
         # Squared Euclidean distance is the k-means metric and corresponds to
         # the Gaussian/EM interpretation in Appendix G of the DKM paper.

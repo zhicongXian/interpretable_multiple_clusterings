@@ -284,6 +284,25 @@ class SemiOrthogonalProjectionHead(nn.Module):
         else:
             return F.linear(weighted, self.weight_raw)
 
+
+class SoftClusterAssignmentHead(nn.Module):
+    """Map a projected view to differentiable cluster probabilities."""
+
+    def __init__(self, input_dim: int, cluster_count: int) -> None:
+        super().__init__()
+        if input_dim < 1 or cluster_count < 2:
+            raise ValueError("The assignment head needs positive dimensions and K >= 2.")
+        self.normalization = nn.LayerNorm(input_dim)
+        self.linear = nn.Linear(input_dim, cluster_count)
+        nn.init.xavier_uniform_(self.linear.weight)
+        nn.init.zeros_(self.linear.bias)
+
+    def forward(self, projected: Tensor, temperature: float) -> tuple[Tensor, Tensor]:
+        logits = self.linear(self.normalization(projected))
+        probabilities = torch.softmax(logits / temperature, dim=1)
+        return logits, probabilities
+
+
 class GenericSelfExpressiveMultiView(nn.Module):
     """Shared nonlinear representation with learned generic latent views."""
 
@@ -305,6 +324,7 @@ class GenericSelfExpressiveMultiView(nn.Module):
         self_expression_threshold: float = 0.1,
         self_expression_coefficient_scale: float = 0.1,
         elastic_net_l1_ratio: float = 0.9,
+        cluster_assignment_temperature: float = 1.0,
     ) -> None:
         super().__init__()
         self.image_shape = tuple(int(value) for value in image_shape)
@@ -325,6 +345,9 @@ class GenericSelfExpressiveMultiView(nn.Module):
         )
         if self.projection_dim > self.latent_dim:
             raise ValueError("projection_dim cannot exceed latent_dim.")
+        if cluster_assignment_temperature <= 0.0:
+            raise ValueError("cluster_assignment_temperature must be positive.")
+        self.cluster_assignment_temperature = float(cluster_assignment_temperature)
 
         self.encoder = ResNetEncoder(
             self.image_shape,
@@ -367,6 +390,12 @@ class GenericSelfExpressiveMultiView(nn.Module):
                 for _ in range(self.n_views)
             ]
         )
+        self.cluster_assignment_heads = nn.ModuleList(
+            [
+                SoftClusterAssignmentHead(self.projection_dim, cluster_count)
+                for cluster_count in self.n_clusters
+            ]
+        )
 
     def rotation(self) -> Tensor:
         basis, triangular = torch.linalg.qr(self.rotation_raw)
@@ -405,6 +434,12 @@ class GenericSelfExpressiveMultiView(nn.Module):
             head(projected)
             for head, projected in zip(self.self_expression_heads, projected_views)
         ]
+        cluster_assignments = [
+            head(projected, self.cluster_assignment_temperature)
+            for head, projected in zip(
+                self.cluster_assignment_heads, projected_views
+            )
+        ]
         return {
             "shared": shared,
             "rotated": rotated,
@@ -418,6 +453,8 @@ class GenericSelfExpressiveMultiView(nn.Module):
             "self_expression": self_expression,
             "coefficients": [item["coefficients"] for item in self_expression],
             "affinities": [item["affinity"] for item in self_expression],
+            "cluster_logits": [item[0] for item in cluster_assignments],
+            "soft_assignments": [item[1] for item in cluster_assignments],
         }
 
 @dataclass # (frozen=True)
@@ -426,7 +463,6 @@ class LossWeightsForAugmentation:
     # weight lets clustering reorganize the shared representation.
     reconstruction: float = 1.0
     self_expression: float = 0.2
-    cluster_structure: float = 0.1
     coefficient_regularization: float = 0.002
     stability: float = 0.05
     augmentation_consistency: float = 0.2 # 0.1#0.05
@@ -439,7 +475,8 @@ class LossWeightsForAugmentation:
     latent_variance: float = 0.05
     worst_view_temperature: float = 0.1
     embedding_diversity: float = 0.0 # 0.00002
-    spectral_separation: float = 0.0 #  0.2
+    normalized_cut: float = 0.1
+    cluster_assignment_orthogonality: float = 0.05
 @dataclass # (frozen=True)
 class LossWeights:
     reconstruction: float = 1.0
@@ -749,6 +786,9 @@ def _configure_phase(model: GenericSelfExpressiveMultiView, phase: str) -> None:
     for head in model.self_expression_heads:
         for parameter in head.parameters():
             parameter.requires_grad_(True)
+    for head in model.cluster_assignment_heads:
+        for parameter in head.parameters():
+            parameter.requires_grad_(True)
 
 ######## 1. for view training add the constrastive loss ########
 
@@ -971,57 +1011,83 @@ def semi_orthogonality_loss(projection_weights: Sequence[Tensor]) -> Tensor:
         penalties.append(gram_error.square().mean())
     return torch.stack(penalties).mean()
 
-def spectral_cluster_separation_loss(
+
+def differentiable_normalized_cut_losses(
     affinities: Sequence[Tensor],
+    soft_assignments: Sequence[Tensor],
     n_clusters: Sequence[int],
     *,
-    eigengap_margin: float,
     worst_view_temperature: float,
     eps: float = 1e-8,
-) -> Tensor:
-    """Encourage exactly ``K_v`` graph components in every view.
+) -> tuple[Tensor, Tensor]:
+    """Return normalized MinCut and assignment anti-collapse losses.
 
-    For the normalized Laplacian, the first ``K_v`` eigenvalues are pushed
-    towards zero, while eigenvalue ``K_v + 1`` is kept above a margin. Batches
-    with no ``K_v + 1`` eigenvalue are skipped for this term.
+    For each view with affinity ``A``, degree matrix ``D``, and soft cluster
+    assignments ``P``, the MinCut relaxation is
+
+    ``-tr(P^T A P) / tr(P^T D P)``.
+
+    The accompanying Frobenius penalty pushes ``P^T P`` toward a scaled
+    identity.  It discourages both the single-cluster solution and identical
+    uniform assignments while encouraging approximately balanced clusters.
+    Neither term requires an eigendecomposition.
     """
 
-    per_view: list[Tensor] = []
-    for affinity, cluster_count in zip(affinities, n_clusters):
+    if not (
+        len(affinities) == len(soft_assignments) == len(n_clusters)
+    ):
+        raise ValueError(
+            "Provide one affinity, assignment matrix, and cluster count per view."
+        )
+
+    cut_per_view: list[Tensor] = []
+    orthogonality_per_view: list[Tensor] = []
+    for affinity, assignment, cluster_count in zip(
+        affinities, soft_assignments, n_clusters
+    ):
         sample_count = affinity.shape[0]
-        if sample_count <= cluster_count:
-            per_view.append(affinity.new_zeros(()))
-            continue
+        if affinity.ndim != 2 or affinity.shape != (sample_count, sample_count):
+            raise ValueError("Every affinity must be a square matrix.")
+        if assignment.shape != (sample_count, cluster_count):
+            raise ValueError(
+                "Every soft assignment must have shape [batch, cluster_count]."
+            )
+        if not bool(torch.isfinite(affinity).all()) or not bool(
+            torch.isfinite(assignment).all()
+        ):
+            raise FloatingPointError(
+                "Normalized MinCut received NaN or Inf affinity/assignment values."
+            )
 
         affinity = 0.5 * (affinity + affinity.transpose(0, 1))
-        degree = affinity.sum(dim=1).clamp_min(eps)
-        inverse_sqrt_degree = degree.rsqrt()
-        normalized_affinity = (
-            inverse_sqrt_degree[:, None]
-            * affinity
-            * inverse_sqrt_degree[None, :]
+        affinity = affinity.clamp_min(0.0)
+        degree = affinity.sum(dim=1)
+
+        # tr(P^T A P), evaluated without constructing the K x K product.
+        within_cluster_affinity = (assignment * (affinity @ assignment)).sum()
+        # tr(P^T D P), with D represented by its degree vector.
+        cluster_volume = (degree[:, None] * assignment.square()).sum()
+        cut_per_view.append(
+            -within_cluster_affinity / cluster_volume.clamp_min(eps)
         )
-        identity = torch.eye(
-            sample_count, device=affinity.device, dtype=affinity.dtype
+
+        assignment_gram = assignment.transpose(0, 1) @ assignment
+        normalized_gram = assignment_gram / torch.linalg.vector_norm(
+            assignment_gram
+        ).clamp_min(eps)
+        target = torch.eye(
+            cluster_count,
+            device=assignment.device,
+            dtype=assignment.dtype,
+        ) / math.sqrt(float(cluster_count))
+        orthogonality_per_view.append(
+            torch.linalg.vector_norm(normalized_gram - target)
         )
-        laplacian = identity - normalized_affinity
-        laplacian = 0.5 * (laplacian + laplacian.transpose(0, 1))
-        original_dtype = laplacian.dtype
 
-        with torch.no_grad():
-            laplacian = laplacian.to(torch.float64)
-            scale = laplacian.abs().amax().detach().clamp_min(1.0)
-            laplacian = laplacian / scale
-            laplacian = laplacian + 1e-8*identity
-
-            eigenvalues = torch.linalg.eigvalsh(laplacian).clamp_min(0.0)
-
-        small_eigenvalues = eigenvalues[:cluster_count].square().mean()
-        next_eigenvalue = eigenvalues[cluster_count]
-        eigengap = F.relu(eigengap_margin - next_eigenvalue).square()
-        per_view.append(small_eigenvalues + eigengap)
-    res = smooth_worst_view(per_view, worst_view_temperature)
-    return res
+    return (
+        smooth_worst_view(cut_per_view, worst_view_temperature),
+        smooth_worst_view(orthogonality_per_view, worst_view_temperature),
+    )
 
 def multiview_loss_with_augmentation(
     images: Tensor,
@@ -1031,7 +1097,6 @@ def multiview_loss_with_augmentation(
     n_clusters: Sequence[int],
     minimum_effective_dimensions: float,
     augmented: tuple[dict[str, Any], dict[str, Any]] | None = None,
-eigengap_margin: float
 ) -> tuple[Tensor, dict[str, Tensor]]:
     if len(n_clusters) != len(outputs["affinities"]):
         raise ValueError("Provide one cluster count for every projected view.")
@@ -1084,26 +1149,20 @@ eigengap_margin: float
         ],
         weights.worst_view_temperature,
     )
-    # cluster_structure = smooth_worst_view(
-    #     [
-    #         spectral_cluster_structure_loss(affinity, cluster_count)
-    #         for affinity, cluster_count in zip(outputs["affinities"], n_clusters)
-    #     ],
-    #     weights.worst_view_temperature,
-    # )
-
-    spectral_separation= spectral_cluster_separation_loss(
-        outputs["affinities"],
-        n_clusters,
-        eigengap_margin=eigengap_margin,
-        worst_view_temperature=weights.worst_view_temperature,
-    ),
     independence = 0.5 * (
         _pairwise_hsic(outputs["projected_views"])
         + _pairwise_hsic(outputs["affinities"])
     )
 
     maximize_latent_diversity = _maximize_latent_diversity(outputs["shared"])
+    normalized_cut, cluster_assignment_orthogonality = (
+        differentiable_normalized_cut_losses(
+            outputs["affinities"],
+            outputs["soft_assignments"],
+            n_clusters,
+            worst_view_temperature=weights.worst_view_temperature,
+        )
+    )
     terms = {
         "reconstruction": F.mse_loss(outputs["reconstruction"], images),
         "self_expression": self_expression,
@@ -1117,12 +1176,8 @@ eigengap_margin: float
         "projection_overlap": semi_orthogonal_overlap_loss(
             outputs["projection_weights"]
         ), # Not so sure whether this is necessary
-        "spectral_separation": spectral_cluster_separation_loss(
-        outputs["affinities"],
-        n_clusters,
-        eigengap_margin=eigengap_margin,
-        worst_view_temperature=weights.worst_view_temperature,
-    ),
+        "normalized_cut": normalized_cut,
+        "cluster_assignment_orthogonality": cluster_assignment_orthogonality,
         "beta_entropy": beta_entropy(outputs["beta"]),
         "beta_mass_balance": beta_mass_balance_loss(outputs["beta"]),
         "beta_effective_dimension": beta_effective_dimension_loss(
@@ -1144,21 +1199,19 @@ def train_phase(
     noise_std: float,
     minimum_effective_dimensions: float,
     device: torch.device,
-    weights: LossWeights,
+    weights: LossWeightsForAugmentation,
     writer: Any | None,
     augmentation_roles=None,
     shape_recolor_strength = 0.6,
     color_shuffle_strength = 0.6,
     upper_lower_mask_split: float = 0.5,
     upper_lower_mask_strength: float = 1.0,
-    eigengap_margin: float = 0.1,
 ) -> list[dict[str, float]]:
     _configure_phase(model, phase)
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(parameters, lr=learning_rate, weight_decay=1e-4)
     history: list[dict[str, float]] = []
 
-    weights = LossWeightsForAugmentation()
     early_stopper = EarlyStopper(patience=70, min_delta=0.005, decimals=10)
     for epoch in range(1, epochs + 1):
         model.train()
@@ -1201,7 +1254,6 @@ def train_phase(
                     n_clusters=model.n_clusters,
                     minimum_effective_dimensions=minimum_effective_dimensions,
                     augmented=augmented,
-                    eigengap_margin=eigengap_margin
                 )
             else:
                 total, terms = multiview_loss(
@@ -1244,6 +1296,25 @@ def train_phase(
                 writer.add_scalar(
                     f"{phase}/self_expression_scale/{name}",
                     float(self_expression_head.coefficient_scale.detach()),
+                    epoch,
+                )
+                assignment = outputs["soft_assignments"][view].detach()
+                marginal = assignment.mean(dim=0)
+                entropy_scale = math.log(float(model.n_clusters[view]))
+                sample_entropy = -(
+                    assignment * assignment.clamp_min(1e-8).log()
+                ).sum(dim=1).mean() / entropy_scale
+                balance_entropy = -(
+                    marginal * marginal.clamp_min(1e-8).log()
+                ).sum() / entropy_scale
+                writer.add_scalar(
+                    f"{phase}/cluster_assignment_entropy/{name}",
+                    float(sample_entropy),
+                    epoch,
+                )
+                writer.add_scalar(
+                    f"{phase}/cluster_balance_entropy/{name}",
+                    float(balance_entropy),
                     epoch,
                 )
     _configure_phase(model, "joint")
@@ -1624,6 +1695,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--senet-threshold", type=float, default=0.1)
     parser.add_argument("--senet-coefficient-scale", type=float, default=0.1)
     parser.add_argument("--elastic-net-l1-ratio", type=float, default=0.9)
+    parser.add_argument(
+        "--cluster-assignment-temperature",
+        type=float,
+        default=1.0,
+        help="Softmax temperature of the per-view cluster assignment heads.",
+    )
+    parser.add_argument(
+        "--normalized-cut-weight",
+        type=float,
+        default=0.1,
+        help="Weight of the differentiable normalized MinCut loss.",
+    )
+    parser.add_argument(
+        "--cluster-orthogonality-weight",
+        type=float,
+        default=0.05,
+        help="Weight preventing collapsed or uniform cluster assignments.",
+    )
     parser.add_argument("--spectral-neighbors", type=int, default=20)
     parser.add_argument("--minimum-effective-dimensions", type=float, default=None)
     parser.add_argument("--pretrain-epochs", type=int, default=200)
@@ -1650,7 +1739,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-test-samples", type=int, default=None)
     parser.add_argument("--sample-index", type=int, default=0)
-    parser.add_argument("--eigengap-margin", type=float, default=0.2)
     parser.add_argument("--experiment-name", type=str, default="v1")
     parser.add_argument(
         "--visualization", type=Path, default=Path("generic_multiview_views_soft_nmi_aug.html")
@@ -1705,6 +1793,10 @@ def run(args: argparse.Namespace) -> None:
     same_seeds(args.seed)
     if min(args.pretrain_epochs, args.view_epochs, args.joint_epochs) < 0:
         raise ValueError("Epoch counts must be nonnegative.")
+    if args.cluster_assignment_temperature <= 0.0:
+        raise ValueError("cluster-assignment-temperature must be positive.")
+    if min(args.normalized_cut_weight, args.cluster_orthogonality_weight) < 0.0:
+        raise ValueError("Normalized-cut loss weights must be nonnegative.")
     if args.view_names is not None and len(args.view_names) != len(args.clusters):
         raise ValueError("view-names and clusters must have the same length.")
     if not 0.0 < args.upper_lower_mask_split < 1.0:
@@ -1756,13 +1848,17 @@ def run(args: argparse.Namespace) -> None:
         self_expression_threshold=args.senet_threshold,
         self_expression_coefficient_scale=args.senet_coefficient_scale,
         elastic_net_l1_ratio=args.elastic_net_l1_ratio,
+        cluster_assignment_temperature=args.cluster_assignment_temperature,
     ).to(device)
     minimum_effective_dimensions = (
         float(args.minimum_effective_dimensions)
         if args.minimum_effective_dimensions is not None
         else max(2.0, model.latent_dim / (2.0 * model.n_views))
     )
-    weights = LossWeights()
+    weights = LossWeightsForAugmentation(
+        normalized_cut=args.normalized_cut_weight,
+        cluster_assignment_orthogonality=args.cluster_orthogonality_weight,
+    )
     writer = _make_writer(args.tensorboard_log_dir)
     try:
         pretrain_history = pretrain_autoencoder(
@@ -1823,7 +1919,6 @@ def run(args: argparse.Namespace) -> None:
             augmentation_roles=args.augmentation_roles,
             upper_lower_mask_split=args.upper_lower_mask_split,
             upper_lower_mask_strength=args.upper_lower_mask_strength,
-            eigengap_margin=args.eigengap_margin,
         )
         print("evaluation after VIEW TRAINING")
         test_metrics = evaluate_clustering(
@@ -1849,7 +1944,6 @@ def run(args: argparse.Namespace) -> None:
             augmentation_roles=args.augmentation_roles,
             upper_lower_mask_split=args.upper_lower_mask_split,
             upper_lower_mask_strength=args.upper_lower_mask_strength,
-            eigengap_margin=args.eigengap_margin,
         )
         test_metrics = evaluate_clustering(
             model,
@@ -1924,6 +2018,7 @@ def inference(args: argparse.Namespace):
         self_expression_threshold=args.senet_threshold,
         self_expression_coefficient_scale=args.senet_coefficient_scale,
         elastic_net_l1_ratio=args.elastic_net_l1_ratio,
+        cluster_assignment_temperature=args.cluster_assignment_temperature,
     ).to(device)
 
     model.load_state_dict(checkpoint["state_dict"], strict=True)
