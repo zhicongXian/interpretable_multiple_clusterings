@@ -21,9 +21,9 @@ export LAPACK=/usr/lib/x86_64-linux-gnu/lapack/liblapack.a
 # pip install -U pip setuptools wheel
 # train
 python3 ./generic_self_expressive_multiview_clustering_senet_style.py --clusters=3,3 \
---pretrain-epochs=5000 \
+--pretrain-epochs=100 \
 --joint-epochs=1000 \
---view-epochs=3000 \
+--view-epochs=1000 \
 --checkpoint=./outputs/stickfigures_senet.pt \
 --visualization=./outputs/stickfigures_senet.html \
 --dataset=stickfigures \
