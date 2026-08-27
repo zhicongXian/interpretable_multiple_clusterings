@@ -289,6 +289,7 @@ class LossWeightsForAugmentation:
     latent_variance: float = 0.0 # 0.05
     worst_view_temperature: float = 0.1
     embedding_diversity: float = 0.0 # 0.00002
+    clustering_diversity: float = 10
 @dataclass # (frozen=True)
 class LossWeights:
     reconstruction: float = 1.0
@@ -501,10 +502,13 @@ def multiview_loss(
         ],
         weights.worst_view_temperature,
     )
-    independence = 0.5 * (
-        _pairwise_hsic(outputs["projected_views"])
-        + _pairwise_hsic_projected_view(outputs["affinities"])#_pairwise_hsic(outputs["affinities"])
-    )
+    independence = _pairwise_hsic(outputs["projected_views"])
+    # 0.5 * (
+    #     _pairwise_hsic(outputs["projected_views"])
+    #     + _pairwise_hsic_projected_view(outputs["affinities"])#_pairwise_hsic(outputs["affinities"])
+    # )
+    clustering_diversity = _pairwise_hsic_projected_view(outputs["affinities"])#_pairwise_hsic(outputs["affinities"])
+
     maximize_latent_diversity = _maximize_latent_diversity(outputs["shared"])
     terms = {
         "reconstruction": F.mse_loss(outputs["reconstruction"], images),
@@ -512,6 +516,7 @@ def multiview_loss(
         "coefficient_entropy": coefficient_entropy,
         "stability": stability,
         "independence": independence,
+        "clustering_diversity": clustering_diversity,
         "projection_overlap": semi_orthogonal_overlap_loss(
             outputs["projection_weights"]
         ),
@@ -887,10 +892,18 @@ def multiview_loss_with_augmentation(
     #     ],
     #     weights.worst_view_temperature,
     # )
-    independence = 0.5 * (
-        _pairwise_hsic(outputs["projected_views"])
-        + _pairwise_hsic(outputs["affinities"])
-    )
+    # independence = 0.5 * (
+    #     _pairwise_hsic(outputs["projected_views"])
+    #     + _pairwise_hsic(outputs["affinities"])
+    # )
+
+    independence = _pairwise_hsic(outputs["projected_views"])
+    # 0.5 * (
+    #     _pairwise_hsic(outputs["projected_views"])
+    #     + _pairwise_hsic_projected_view(outputs["affinities"])#_pairwise_hsic(outputs["affinities"])
+    # )
+    clustering_diversity = _pairwise_hsic_projected_view(outputs["affinities"])#_pairwise_hsic(outputs["affinities"])
+
     maximize_latent_diversity = _maximize_latent_diversity(outputs["shared"])
     terms = {
         "reconstruction": F.mse_loss(outputs["reconstruction"], images),
@@ -899,6 +912,7 @@ def multiview_loss_with_augmentation(
         "stability": stability,
         "augmentation_consistency": augmentation_consistency,
         "independence": independence,
+        "clustering_diversity": clustering_diversity,
         "projection_orthogonality": semi_orthogonality_loss(
             outputs["projection_weights"]
         ),
