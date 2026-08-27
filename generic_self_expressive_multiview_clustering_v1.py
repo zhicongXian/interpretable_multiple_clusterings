@@ -161,6 +161,7 @@ class GenericSelfExpressiveMultiView(nn.Module):
         decoder_channels: Sequence[int] = (64, 32, 16, 8),
         self_expression_temperature: float = 0.2,
         self_expression_neighbors: int = 16,
+        dropout: float = 0.2,
     ) -> None:
         super().__init__()
         self.image_shape = tuple(int(value) for value in image_shape)
@@ -187,13 +188,13 @@ class GenericSelfExpressiveMultiView(nn.Module):
             encoder_channels,
             encoder_blocks,
             self.latent_dim,
-            dropout=0.1,
+            dropout=dropout,
         )
         self.decoder = ResNetDecoder(
             self.latent_dim,
             self.image_shape,
             decoder_channels,
-            dropout=0.1,
+            dropout=dropout,
         )
         self.rotation_raw = nn.Parameter(torch.empty(self.latent_dim, self.latent_dim))
         nn.init.orthogonal_(self.rotation_raw)
@@ -219,10 +220,21 @@ class GenericSelfExpressiveMultiView(nn.Module):
         )
 
     def rotation(self) -> Tensor:
-        basis, triangular = torch.linalg.qr(self.rotation_raw)
-        signs = torch.sign(torch.diagonal(triangular)).detach()
-        signs = torch.where(signs == 0, torch.ones_like(signs), signs)
-        return basis * signs.unsqueeze(0) # this only creates rotation basis
+        """Return the learned rotation without re-orthogonalizing it.
+
+        ``rotation_raw`` is initialized orthogonally and is kept approximately
+        orthogonal by an initialization-only loss during autoencoder
+        pretraining.  In the subsequent view and joint phases it is an
+        unconstrained trainable parameter, as in Sections 2.6--2.7 of ENRC.
+        """
+        return self.rotation_raw
+
+    def rotation_orthogonality_loss(self, latent: Tensor) -> Tensor:
+        """ENRC Eq. (8), averaged over the batch, with stop-gradient on z."""
+        fixed_latent = latent.detach()
+        rotation = self.rotation_raw
+        reconstructed = fixed_latent @ rotation @ rotation.transpose(0, 1)
+        return (fixed_latent - reconstructed).square().sum(dim=1).mean()
 
     def beta(self) -> Tensor:
         return torch.softmax(self.beta_logits, dim=0)
@@ -244,7 +256,8 @@ class GenericSelfExpressiveMultiView(nn.Module):
         ]
 
     def autoencode(self, images: Tensor) -> Tensor:
-        return self.decoder(self.encoder(images))
+        shared, rotated_share, rotation = self.encode_rotated(images)
+        return self.decoder(rotated_share@rotation.T)
 
     def forward(self, images: Tensor) -> dict[str, Any]:
         shared, rotated, rotation = self.encode_rotated(images)
@@ -551,10 +564,21 @@ def pretrain_autoencoder(
     noise_std: float,
     device: torch.device,
     writer: Any | None,
-    loss_weight = 0.0 #0.002
+    loss_weight: float = 0.0, #0.002
+    rotation_orthogonality_weight: float = 1.0,
 ) -> list[float]:
-    parameters = itertools.chain(model.encoder.parameters(), model.decoder.parameters())
-    optimizer = torch.optim.AdamW(parameters, lr=learning_rate, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(
+        [
+            {
+                "params": itertools.chain(
+                    model.encoder.parameters(), model.decoder.parameters()
+                ),
+                "weight_decay": 1e-4,
+            },
+            {"params": [model.rotation_raw], "weight_decay": 0.0},
+        ],
+        lr=learning_rate,
+    )
     history: list[float] = []
     total_coding_rate = TotalCodingRate(eps=1.0)
     for epoch in range(1, epochs + 1):
@@ -563,6 +587,7 @@ def pretrain_autoencoder(
         count = 0
         reconstruction_loss = 0.0
         mcr_loss = 0.0
+        rotation_orthogonality_loss = 0.0
         for images, _ in loader:
             images = images.to(device)
             corrupted = (images + noise_std * torch.randn_like(images)).clamp(0, 1)
@@ -572,20 +597,39 @@ def pretrain_autoencoder(
             latent_corrupted= model.encoder(corrupted)
             mcr_loss_tensor = 0.5 * loss_weight * (total_coding_rate(latent_image, latent_image) + total_coding_rate(latent_corrupted,
                                                                                                    latent_corrupted))
-            loss = recon_loss + mcr_loss_tensor
+            rotation_orthogonality_loss_tensor = (
+                rotation_orthogonality_weight
+                * model.rotation_orthogonality_loss(latent_image)
+            )
+            loss = recon_loss + mcr_loss_tensor + rotation_orthogonality_loss_tensor
             loss.backward()
             optimizer.step()
             running += float(loss.detach()) * images.shape[0]
             reconstruction_loss += float(recon_loss.detach()) * images.shape[0]
             mcr_loss += float(mcr_loss_tensor.detach())
+            rotation_orthogonality_loss += (
+                float(rotation_orthogonality_loss_tensor.detach()) * images.shape[0]
+            )
             count += images.shape[0]
         value = running / max(count, 1)
         history.append(value)
         print(f"pretrain epoch {epoch:03d}/{epochs:03d} total={value:.6f},"
               f" reconstruction_loss={reconstruction_loss/max(count, 1)}, "
-              f"mcr_loss={mcr_loss}")
+              f"mcr_loss={mcr_loss}, "
+              f"rotation_orthogonality_loss="
+              f"{rotation_orthogonality_loss/max(count, 1)}")
         if writer is not None:
-            writer.add_scalar("pretrain/reconstruction", value, epoch)
+            writer.add_scalar("pretrain/total", value, epoch)
+            writer.add_scalar(
+                "pretrain/reconstruction",
+                reconstruction_loss / max(count, 1),
+                epoch,
+            )
+            writer.add_scalar(
+                "pretrain/rotation_orthogonality",
+                rotation_orthogonality_loss / max(count, 1),
+                epoch,
+            )
     return history
 
 
@@ -1397,6 +1441,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--joint-epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--pretrain-learning-rate", type=float, default=1e-4)
+    parser.add_argument(
+        "--pretrain-rotation-orthogonality-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight of the ENRC initialization-only rotation orthogonality "
+            "loss. It is not used during view or joint training."
+        ),
+    )
     parser.add_argument("--view-learning-rate", type=float, default=1e-4)
     parser.add_argument("--joint-learning-rate", type=float, default=1e-4)
     parser.add_argument("--noise-std", type=float, default=0.01)
@@ -1469,6 +1522,8 @@ def run(args: argparse.Namespace) -> None:
     same_seeds(args.seed)
     if min(args.pretrain_epochs, args.view_epochs, args.joint_epochs) < 0:
         raise ValueError("Epoch counts must be nonnegative.")
+    if args.pretrain_rotation_orthogonality_weight < 0:
+        raise ValueError("pretrain-rotation-orthogonality-weight must be nonnegative.")
     if args.view_names is not None and len(args.view_names) != len(args.clusters):
         raise ValueError("view-names and clusters must have the same length.")
     if not 0.0 < args.upper_lower_mask_split < 1.0:
@@ -1532,6 +1587,9 @@ def run(args: argparse.Namespace) -> None:
             noise_std=args.noise_std,
             device=device,
             writer=writer,
+            rotation_orthogonality_weight=(
+                args.pretrain_rotation_orthogonality_weight
+            ),
         )
         # save latent embeddings after pretraining:
         train_x = []
