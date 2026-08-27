@@ -489,7 +489,7 @@ class LossWeightsForAugmentation:
     latent_variance: float = 0.05
     worst_view_temperature: float = 0.1
     embedding_diversity: float = 0.0 # 0.00002
-    normalized_cut: float = 0.1
+    normalized_cut: float = 0.0 # 0.1
     cluster_assignment_orthogonality: float = 0.05
 @dataclass # (frozen=True)
 class LossWeights:
