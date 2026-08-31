@@ -74,7 +74,15 @@ def _limited(dataset: Dataset[Any], maximum: int | None, seed: int) -> Dataset[A
     generator = torch.Generator().manual_seed(seed)
     indices = torch.randperm(len(dataset), generator=generator)[:maximum].tolist()
     return Subset(dataset, indices) # Subset of a dataset at specified indices.
-
+class AdaptiveSoftThreshold(nn.Module):
+    def __init__(self, dim):
+        super(AdaptiveSoftThreshold, self).__init__()
+        self.dim = dim
+        self.register_parameter("bias", nn.Parameter(torch.from_numpy(np.zeros(shape=[self.dim])).float()))
+        # self.bias = nn.Parameter(torch.from_numpy(np.zeros(shape=[self.dim])).float())
+    def forward(self, c):
+        bias =  self.bias.to(device=c.device, dtype=c.dtype)
+        return torch.sign(c) * torch.relu(torch.abs(c) - bias)
 
 class SENetSelfExpression(nn.Module):
     """Generate sparse signed self-expression coefficients from embeddings.
@@ -145,6 +153,8 @@ class SENetSelfExpression(nn.Module):
         self.raw_coefficient_scale = nn.Parameter(
             torch.tensor(self._inverse_softplus(initial_coefficient_scale))
         )
+        self.thres = AdaptiveSoftThreshold(1)
+        self.shrink =  1.0 / self.n_neighbors
 
     @staticmethod
     def _inverse_softplus(value: float) -> float:
@@ -217,7 +227,9 @@ class SENetSelfExpression(nn.Module):
         scale = self.coefficient_scale.to(
             device=scores.device, dtype=scores.dtype
         )
-        coefficients = scale * scores.sign() * F.relu(scores.abs() - threshold)
+        # scale = 1
+        coefficients = self.shrink *self.thres(scores)
+        # coefficients = scale * scores.sign() * F.relu(scores.abs() - threshold)
         coefficients = coefficients.masked_fill(~support, 0.0)
         coefficients = coefficients.masked_fill(diagonal, 0.0)
         return coefficients
@@ -417,6 +429,24 @@ class GenericSelfExpressiveMultiView(nn.Module):
         signs = torch.where(signs == 0, torch.ones_like(signs), signs)
         return basis * signs.unsqueeze(0) # this only creates rotation basis
 
+    # def rotation(self) -> Tensor:
+    #     """Return the learned rotation without re-orthogonalizing it.
+    #
+    #     ``rotation_raw`` is initialized orthogonally and is kept approximately
+    #     orthogonal by an initialization-only loss during autoencoder
+    #     pretraining.  In the subsequent view and joint phases it is an
+    #     unconstrained trainable parameter, as in Sections 2.6--2.7 of ENRC.
+    #     """
+    #     return self.rotation_raw
+    #
+    # def rotation_orthogonality_loss(self, latent: Tensor) -> Tensor:
+    #     """ENRC Eq. (8), averaged over the batch, with stop-gradient on z."""
+    #     fixed_latent = latent.detach()
+    #     rotation = self.rotation_raw
+    #     reconstructed = fixed_latent @ rotation @ rotation.transpose(0, 1)
+    #     return (fixed_latent - reconstructed).square().sum(dim=1).mean()
+
+
     def beta(self) -> Tensor:
         return torch.softmax(self.beta_logits, dim=0)
 
@@ -479,7 +509,7 @@ class LossWeightsForAugmentation:
     self_expression: float = 0.2
     coefficient_regularization: float = 0.02
     stability: float = 0.05
-    augmentation_consistency: float = 0.2 # 0.1#0.05
+    augmentation_consistency: float = 100 #0.2 # 0.1#0.05
     independence: float = 0.2 #0.02 # 0.02
     projection_orthogonality: float = 0.001#0.01
     projection_overlap: float = 0.005 # 0.05
@@ -489,7 +519,7 @@ class LossWeightsForAugmentation:
     latent_variance: float = 0.05
     worst_view_temperature: float = 0.1
     embedding_diversity: float = 0.0 # 0.00002
-    normalized_cut: float = 0.0 # 0.1
+    normalized_cut: float = 0.1 # 0.1
     cluster_assignment_orthogonality: float = 0.05
 @dataclass # (frozen=True)
 class LossWeights:
@@ -735,7 +765,6 @@ def _make_writer(path: Path | None) -> Any | None:
         raise ImportError("Install tensorboard to enable logging.") from error
     return SummaryWriter(log_dir=str(path))
 
-
 def pretrain_autoencoder(
     model: GenericSelfExpressiveMultiView,
     loader: DataLoader,
@@ -782,6 +811,83 @@ def pretrain_autoencoder(
             writer.add_scalar("pretrain/reconstruction", value, epoch)
             writer.add_scalar("pretrain/mcr", mcr_loss, epoch)
     return history
+
+# def pretrain_autoencoder(
+#     model: GenericSelfExpressiveMultiView,
+#     loader: DataLoader,
+#     *,
+#     epochs: int,
+#     learning_rate: float,
+#     noise_std: float,
+#     device: torch.device,
+#     writer: Any | None,
+#     loss_weight: float = 0.0, #0.002
+#     rotation_orthogonality_weight: float = 1.0,
+# ) -> list[float]:
+#     optimizer = torch.optim.AdamW(
+#         [
+#             {
+#                 "params": itertools.chain(
+#                     model.encoder.parameters(), model.decoder.parameters()
+#                 ),
+#                 "weight_decay": 1e-4,
+#             },
+#             {"params": [model.rotation_raw], "weight_decay": 0.0},
+#         ],
+#         lr=learning_rate,
+#     )
+#     history: list[float] = []
+#     total_coding_rate = TotalCodingRate(eps=1.0)
+#     for epoch in range(1, epochs + 1):
+#         model.train()
+#         running = 0.0
+#         count = 0
+#         reconstruction_loss = 0.0
+#         mcr_loss = 0.0
+#         rotation_orthogonality_loss = 0.0
+#         for images, _ in loader:
+#             images = images.to(device)
+#             corrupted = (images + noise_std * torch.randn_like(images)).clamp(0, 1)
+#             optimizer.zero_grad(set_to_none=True)
+#             recon_loss = F.mse_loss(model.autoencode(corrupted), images)
+#             latent_image = model.encoder(images)
+#             latent_corrupted= model.encoder(corrupted)
+#             mcr_loss_tensor = 0.5 * loss_weight * (total_coding_rate(latent_image, latent_image) + total_coding_rate(latent_corrupted,
+#                                                                                                    latent_corrupted))
+#             rotation_orthogonality_loss_tensor = (
+#                 rotation_orthogonality_weight
+#                 * model.rotation_orthogonality_loss(latent_image)
+#             )
+#             loss = recon_loss + mcr_loss_tensor + rotation_orthogonality_loss_tensor
+#             loss.backward()
+#             optimizer.step()
+#             running += float(loss.detach()) * images.shape[0]
+#             reconstruction_loss += float(recon_loss.detach()) * images.shape[0]
+#             mcr_loss += float(mcr_loss_tensor.detach())
+#             rotation_orthogonality_loss += (
+#                 float(rotation_orthogonality_loss_tensor.detach()) * images.shape[0]
+#             )
+#             count += images.shape[0]
+#         value = running / max(count, 1)
+#         history.append(value)
+#         print(f"pretrain epoch {epoch:03d}/{epochs:03d} total={value:.6f},"
+#               f" reconstruction_loss={reconstruction_loss/max(count, 1)}, "
+#               f"mcr_loss={mcr_loss}, "
+#               f"rotation_orthogonality_loss="
+#               f"{rotation_orthogonality_loss/max(count, 1)}")
+#         if writer is not None:
+#             writer.add_scalar("pretrain/total", value, epoch)
+#             writer.add_scalar(
+#                 "pretrain/reconstruction",
+#                 reconstruction_loss / max(count, 1),
+#                 epoch,
+#             )
+#             writer.add_scalar(
+#                 "pretrain/rotation_orthogonality",
+#                 rotation_orthogonality_loss / max(count, 1),
+#                 epoch,
+#             )
+#     return history
 
 
 def _configure_phase(model: GenericSelfExpressiveMultiView, phase: str) -> None:
@@ -1266,7 +1372,7 @@ def train_phase(
         # This term stays disabled in every phase. View independence is already
         # enforced explicitly; dispersing the shared embedding is not needed.
         if phase=="view":
-            weights.embedding_diversity = 0.01
+            weights.embedding_diversity = 0.0 #0.01
         else:
             weights.embedding_diversity = 0.0
 
@@ -1323,6 +1429,25 @@ def train_phase(
                     + ", ".join(nonfinite_terms)
                 )
             total.backward()
+            if epoch==50 and phase=="joint":
+                named_trainable = [
+                    (name, p)
+                    for name, p in model.named_parameters()
+                    if p.requires_grad
+                ]
+
+                for i, (name, p) in enumerate(named_trainable):
+                    parameter_bad = not torch.isfinite(p.detach()).all().item()
+                    gradient_bad = (
+                            p.grad is not None
+                            and not torch.isfinite(p.grad).all().item()
+                    )
+                    if parameter_bad or gradient_bad:
+                        print(
+                            f"index={i}, name={name}, shape={tuple(p.shape)}, "
+                            f"parameter_bad={parameter_bad}, gradient_bad={gradient_bad}"
+                        )
+                    # I need to print the tuples name
             torch.nn.utils.clip_grad_norm_(
                 parameters,
                 5.0,
@@ -1825,6 +1950,8 @@ def parse_args() -> argparse.Namespace:
             "and the lower role masks the upper region."
         ),
     )
+
+    parser.add_argument("--augmentation-consistency", type=float, default=100)
     return parser.parse_args()
 
 def same_seeds(seed):
@@ -1921,6 +2048,7 @@ def run(args: argparse.Namespace) -> None:
     weights = LossWeightsForAugmentation(
         normalized_cut=args.normalized_cut_weight,
         cluster_assignment_orthogonality=args.cluster_orthogonality_weight,
+        augmentation_consistency=args.augmentation_consistency
     )
     writer = _make_writer(args.tensorboard_log_dir)
     try:

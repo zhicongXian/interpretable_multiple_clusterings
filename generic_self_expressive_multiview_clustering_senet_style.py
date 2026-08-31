@@ -509,7 +509,7 @@ class LossWeightsForAugmentation:
     self_expression: float = 0.2
     coefficient_regularization: float = 0.02
     stability: float = 0.05
-    augmentation_consistency: float = 0.2 # 0.1#0.05
+    augmentation_consistency: float = 100 #0.2 # 0.1#0.05
     independence: float = 0.2 #0.02 # 0.02
     projection_orthogonality: float = 0.001#0.01
     projection_overlap: float = 0.005 # 0.05
@@ -519,7 +519,7 @@ class LossWeightsForAugmentation:
     latent_variance: float = 0.05
     worst_view_temperature: float = 0.1
     embedding_diversity: float = 0.0 # 0.00002
-    normalized_cut: float = 0.0 # 0.1
+    normalized_cut: float = 0.1 # 0.1
     cluster_assignment_orthogonality: float = 0.05
 @dataclass # (frozen=True)
 class LossWeights:
@@ -1372,7 +1372,7 @@ def train_phase(
         # This term stays disabled in every phase. View independence is already
         # enforced explicitly; dispersing the shared embedding is not needed.
         if phase=="view":
-            weights.embedding_diversity = 0.01
+            weights.embedding_diversity = 0.0 #0.01
         else:
             weights.embedding_diversity = 0.0
 
@@ -1950,6 +1950,8 @@ def parse_args() -> argparse.Namespace:
             "and the lower role masks the upper region."
         ),
     )
+
+    parser.add_argument("--augmentation-consistency", type=float, default=100)
     return parser.parse_args()
 
 def same_seeds(seed):
@@ -2046,6 +2048,7 @@ def run(args: argparse.Namespace) -> None:
     weights = LossWeightsForAugmentation(
         normalized_cut=args.normalized_cut_weight,
         cluster_assignment_orthogonality=args.cluster_orthogonality_weight,
+        augmentation_consistency=args.augmentation_consistency
     )
     writer = _make_writer(args.tensorboard_log_dir)
     try:
