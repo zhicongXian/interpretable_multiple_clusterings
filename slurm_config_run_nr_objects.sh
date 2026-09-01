@@ -29,6 +29,6 @@ python3 ./generic_self_expressive_multiview_clustering_senet_style.py --clusters
 --dataset=nr_objects \
 --tensorboard-log-dir=./outputs/runs_nr_objects \
 --augmentation-roles=color,shape,material  \
---experiment-name=with_augmentation
+--experiment-name=with_augmentation \
 --dataset-path=data/datasets/enrc_data/nr_objects >> ./outputs/deep_imc_nr_objects_out.txt
 
