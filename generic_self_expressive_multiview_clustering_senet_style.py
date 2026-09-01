@@ -977,6 +977,132 @@ def _shuffle_space_preserve_color(images: Tensor, strength: float) -> Tensor:
     return (1.0 - strength) * images + strength * shuffled
 
 
+# ---------------------------------------------------------------------------
+# NEW FACET-SPECIFIC AUGMENTATION 1/3: centered object zoom for COLOR
+# ---------------------------------------------------------------------------
+def _center_zoom_preserve_color(
+    images: Tensor,
+    min_scale: float,
+    max_scale: float,
+) -> Tensor:
+    """Zoom into the image center while leaving RGB values unchanged.
+
+    NR-Objects renders the object close to the image center. Varying its scale
+    and removing some background encourages the color view to focus on color
+    evidence rather than the object's absolute size or background extent.
+    """
+
+    if images.ndim != 4:
+        raise ValueError("images must have shape [N, C, H, W].")
+    if not 1.0 <= min_scale <= max_scale:
+        raise ValueError("zoom scales must satisfy 1 <= min_scale <= max_scale.")
+
+    batch_size = images.shape[0]
+    scale = min_scale + (max_scale - min_scale) * torch.rand(
+        batch_size,
+        device=images.device,
+        dtype=images.dtype,
+    )
+    theta = images.new_zeros((batch_size, 2, 3))
+    theta[:, 0, 0] = scale.reciprocal()
+    theta[:, 1, 1] = scale.reciprocal()
+    grid = F.affine_grid(theta, images.shape, align_corners=False)
+    return F.grid_sample(
+        images,
+        grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=False,
+    )
+
+
+def _soft_centered_object_mask(images: Tensor) -> Tensor:
+    """Estimate a soft object mask from its contrast with the image border."""
+
+    if images.ndim != 4:
+        raise ValueError("images must have shape [N, C, H, W].")
+    top = images[..., 0, :]
+    bottom = images[..., -1, :]
+    left = images[..., 1:-1, 0]
+    right = images[..., 1:-1, -1]
+    border = torch.cat((top, bottom, left, right), dim=-1)
+    background = border.median(dim=-1).values[..., None, None]
+    distance = (images - background).square().mean(dim=1, keepdim=True).sqrt()
+    scale = distance.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+    normalized_distance = distance / scale
+    return torch.sigmoid((normalized_distance - 0.18) / 0.04)
+
+
+# ---------------------------------------------------------------------------
+# NEW FACET-SPECIFIC AUGMENTATION 2/3: silhouette extraction for SHAPE
+# ---------------------------------------------------------------------------
+def _shape_silhouette_augmentation(images: Tensor, strength: float) -> Tensor:
+    """Retain object silhouette while suppressing color, texture and highlights."""
+
+    if not 0.0 <= strength <= 1.0:
+        raise ValueError("shape silhouette strength must lie in [0, 1].")
+    silhouette = _soft_centered_object_mask(images).expand(
+        -1, images.shape[1], -1, -1
+    )
+    return (1.0 - strength) * images + strength * silhouette
+
+
+# ---------------------------------------------------------------------------
+# NEW FACET-SPECIFIC AUGMENTATION 3/3: reflections/relighting for MATERIAL
+# ---------------------------------------------------------------------------
+def _material_relighting_augmentation(
+    images: Tensor,
+    relight_strength: float,
+    specular_strength: float,
+) -> Tensor:
+    """Randomize diffuse lighting and specular reflection on the object.
+
+    Metal/rubber information in NR-Objects is expressed by stable local shading
+    and highlight behavior. Random light directions and achromatic highlights
+    prevent the material view from memorizing one renderer illumination.
+    """
+
+    if not 0.0 <= relight_strength <= 1.0:
+        raise ValueError("material relight strength must lie in [0, 1].")
+    if not 0.0 <= specular_strength <= 1.0:
+        raise ValueError("material specular strength must lie in [0, 1].")
+    if images.ndim != 4:
+        raise ValueError("images must have shape [N, C, H, W].")
+
+    batch_size, _, height, width = images.shape
+    y = torch.linspace(-1.0, 1.0, height, device=images.device, dtype=images.dtype)
+    x = torch.linspace(-1.0, 1.0, width, device=images.device, dtype=images.dtype)
+    yy, xx = torch.meshgrid(y, x, indexing="ij")
+    xx = xx[None, None]
+    yy = yy[None, None]
+
+    angle = 2.0 * math.pi * torch.rand(
+        batch_size, 1, 1, 1, device=images.device, dtype=images.dtype
+    )
+    direction = torch.cos(angle) * xx + torch.sin(angle) * yy
+    diffuse = 1.0 + 0.45 * relight_strength * direction
+
+    center_x = -0.55 + 1.10 * torch.rand(
+        batch_size, 1, 1, 1, device=images.device, dtype=images.dtype
+    )
+    center_y = -0.55 + 1.10 * torch.rand(
+        batch_size, 1, 1, 1, device=images.device, dtype=images.dtype
+    )
+    sigma = 0.12 + 0.28 * torch.rand(
+        batch_size, 1, 1, 1, device=images.device, dtype=images.dtype
+    )
+    reflection = torch.exp(
+        -((xx - center_x).square() + (yy - center_y).square())
+        / (2.0 * sigma.square())
+    )
+    amplitude = specular_strength * torch.rand(
+        batch_size, 1, 1, 1, device=images.device, dtype=images.dtype
+    )
+    object_mask = _soft_centered_object_mask(images)
+    relit = images * diffuse + amplitude * reflection * object_mask
+    return relit.clamp(0.0, 1.0)
+
+
 def _mask_vertical_region(
     images: Tensor,
     region: str,
@@ -1017,6 +1143,11 @@ def augment_for_view(
     noise_std: float,
     shape_recolor_strength: float,
     color_shuffle_strength: float,
+    center_zoom_min_scale: float = 1.0,
+    center_zoom_max_scale: float = 1.35,
+    shape_silhouette_strength: float = 0.9,
+    material_relight_strength: float = 0.35,
+    material_specular_strength: float = 0.3,
     upper_lower_mask_split: float = 0.5,
     upper_lower_mask_strength: float = 1.0,
 ) -> Tensor:
@@ -1027,15 +1158,35 @@ def augment_for_view(
     """
 
 
-    if role == "shape": # --TODO is the way to do data augmentation correct?
+    role = role.lower()
+    if role == "shape":
         augmented = _mild_spatial_augmentation(images)
+        augmented = _shape_silhouette_augmentation(
+            augmented, shape_silhouette_strength
+        )
         augmented = _randomize_color_preserve_shape(
             augmented, shape_recolor_strength
         )
     elif role == "color":
-        augmented = _mild_spatial_augmentation(images)
+        augmented = _center_zoom_preserve_color(
+            images,
+            center_zoom_min_scale,
+            center_zoom_max_scale,
+        )
+        augmented = _mild_spatial_augmentation(augmented)
         augmented = _shuffle_space_preserve_color(
             augmented, color_shuffle_strength
+        )
+    elif role == "material":
+        augmented = _mild_spatial_augmentation(images)
+        # Remove hue as a shortcut while retaining intensity/texture cues.
+        augmented = _randomize_color_preserve_shape(
+            augmented, shape_recolor_strength
+        )
+        augmented = _material_relighting_augmentation(
+            augmented,
+            material_relight_strength,
+            material_specular_strength,
         )
     elif role == "upper":
         augmented = images
@@ -1053,7 +1204,9 @@ def augment_for_view(
             split_fraction=upper_lower_mask_split,
             strength=upper_lower_mask_strength,
         )
-    elif role != "generic":
+    elif role == "generic":
+        augmented = images
+    else:
         raise ValueError(f"Unknown augmentation role: {role}")
     if noise_std > 0:
         augmented = augmented + noise_std * torch.randn_like(augmented)
@@ -1068,6 +1221,11 @@ def view_specific_augmented_outputs(
     noise_std: float,
     shape_recolor_strength: float,
     color_shuffle_strength: float,
+    center_zoom_min_scale: float = 1.0,
+    center_zoom_max_scale: float = 1.35,
+    shape_silhouette_strength: float = 0.9,
+    material_relight_strength: float = 0.35,
+    material_specular_strength: float = 0.3,
     upper_lower_mask_split: float = 0.5,
     upper_lower_mask_strength: float = 1.0,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -1083,6 +1241,11 @@ def view_specific_augmented_outputs(
             noise_std=noise_std,
             shape_recolor_strength=shape_recolor_strength,
             color_shuffle_strength=color_shuffle_strength,
+            center_zoom_min_scale=center_zoom_min_scale,
+            center_zoom_max_scale=center_zoom_max_scale,
+            shape_silhouette_strength=shape_silhouette_strength,
+            material_relight_strength=material_relight_strength,
+            material_specular_strength=material_specular_strength,
             upper_lower_mask_split=upper_lower_mask_split,
             upper_lower_mask_strength=upper_lower_mask_strength,
         )
@@ -1356,6 +1519,11 @@ def train_phase(
     augmentation_roles=None,
     shape_recolor_strength = 0.6,
     color_shuffle_strength = 0.6,
+    center_zoom_min_scale: float = 1.0,
+    center_zoom_max_scale: float = 1.35,
+    shape_silhouette_strength: float = 0.9,
+    material_relight_strength: float = 0.35,
+    material_specular_strength: float = 0.3,
     upper_lower_mask_split: float = 0.5,
     upper_lower_mask_strength: float = 1.0,
 ) -> list[dict[str, float]]:
@@ -1399,6 +1567,11 @@ def train_phase(
                         noise_std=noise_std,
                         shape_recolor_strength=shape_recolor_strength,
                         color_shuffle_strength=color_shuffle_strength,
+                        center_zoom_min_scale=center_zoom_min_scale,
+                        center_zoom_max_scale=center_zoom_max_scale,
+                        shape_silhouette_strength=shape_silhouette_strength,
+                        material_relight_strength=material_relight_strength,
+                        material_specular_strength=material_specular_strength,
                         upper_lower_mask_split=upper_lower_mask_split,
                         upper_lower_mask_strength=upper_lower_mask_strength,
                     )
@@ -1912,6 +2085,48 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--joint-learning-rate", type=float, default=5e-5)
     parser.add_argument("--noise-std", type=float, default=0.01)
     parser.add_argument(
+        "--shape-recolor-strength",
+        type=float,
+        default=0.6,
+        help="Random recoloring strength used to remove color shortcuts.",
+    )
+    parser.add_argument(
+        "--color-shuffle-strength",
+        type=float,
+        default=0.6,
+        help="Spatial shuffle strength used to suppress shape in the color view.",
+    )
+    parser.add_argument(
+        "--center-zoom-min-scale",
+        type=float,
+        default=1.0,
+        help="Minimum centered object zoom for the color view.",
+    )
+    parser.add_argument(
+        "--center-zoom-max-scale",
+        type=float,
+        default=1.35,
+        help="Maximum centered object zoom for the color view.",
+    )
+    parser.add_argument(
+        "--shape-silhouette-strength",
+        type=float,
+        default=0.9,
+        help="Strength of color/texture suppression in the shape view.",
+    )
+    parser.add_argument(
+        "--material-relight-strength",
+        type=float,
+        default=0.35,
+        help="Strength of random directional lighting in the material view.",
+    )
+    parser.add_argument(
+        "--material-specular-strength",
+        type=float,
+        default=0.3,
+        help="Maximum strength of random achromatic reflections.",
+    )
+    parser.add_argument(
         "--upper-lower-mask-split",
         type=float,
         default=0.5,
@@ -1945,9 +2160,10 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Comma-separated semantic content preserved by each view. "
-            "Use shape,color for the shape-color dataset or upper,lower "
-            "for stick figures. The upper role masks the lower image region, "
-            "and the lower role masks the upper region."
+            "Supported roles: color,shape,material,upper,lower,generic. "
+            "Use color,shape,material for NR-Objects or upper,lower for stick "
+            "figures. The upper role masks the lower image region, and the "
+            "lower role masks the upper region."
         ),
     )
 
@@ -1993,6 +2209,48 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("upper-lower-mask-split must lie strictly between 0 and 1.")
     if not 0.0 <= args.upper_lower_mask_strength <= 1.0:
         raise ValueError("upper-lower-mask-strength must lie in [0, 1].")
+    facet_strengths = {
+        "shape-recolor-strength": args.shape_recolor_strength,
+        "color-shuffle-strength": args.color_shuffle_strength,
+        "shape-silhouette-strength": args.shape_silhouette_strength,
+        "material-relight-strength": args.material_relight_strength,
+        "material-specular-strength": args.material_specular_strength,
+    }
+    invalid_strengths = [
+        name for name, value in facet_strengths.items()
+        if not 0.0 <= value <= 1.0
+    ]
+    if invalid_strengths:
+        raise ValueError(
+            "Facet augmentation strengths must lie in [0, 1]: "
+            + ", ".join(invalid_strengths)
+        )
+    if not 1.0 <= args.center_zoom_min_scale <= args.center_zoom_max_scale:
+        raise ValueError(
+            "center zoom scales must satisfy 1 <= min_scale <= max_scale."
+        )
+    if args.augmentation_roles is not None:
+        args.augmentation_roles = tuple(
+            role.lower() for role in args.augmentation_roles
+        )
+        allowed_roles = {"color", "shape", "material", "upper", "lower", "generic"}
+        unknown_roles = sorted(set(args.augmentation_roles) - allowed_roles)
+        if unknown_roles:
+            raise ValueError(
+                "Unknown augmentation roles: " + ", ".join(unknown_roles)
+            )
+    if (
+        args.dataset.lower() == "nr_objects"
+        and args.augmentation_roles is None
+        and sorted(args.clusters) == [2, 3, 6]
+    ):
+        # Standard NR-Objects: 6 colors, 3 shapes, and 2 materials. Preserve
+        # the user's cluster order when selecting semantic augmentations.
+        role_by_cluster_count = {6: "color", 3: "shape", 2: "material"}
+        args.augmentation_roles = tuple(
+            role_by_cluster_count[cluster_count]
+            for cluster_count in args.clusters
+        )
     if args.dataset.lower() == "stickfigures" and args.augmentation_roles is None:
         if len(args.clusters) != 2:
             raise ValueError(
@@ -2108,6 +2366,13 @@ def run(args: argparse.Namespace) -> None:
             weights=weights,
             writer=writer,
             augmentation_roles=args.augmentation_roles,
+            shape_recolor_strength=args.shape_recolor_strength,
+            color_shuffle_strength=args.color_shuffle_strength,
+            center_zoom_min_scale=args.center_zoom_min_scale,
+            center_zoom_max_scale=args.center_zoom_max_scale,
+            shape_silhouette_strength=args.shape_silhouette_strength,
+            material_relight_strength=args.material_relight_strength,
+            material_specular_strength=args.material_specular_strength,
             upper_lower_mask_split=args.upper_lower_mask_split,
             upper_lower_mask_strength=args.upper_lower_mask_strength,
         )
@@ -2133,6 +2398,13 @@ def run(args: argparse.Namespace) -> None:
             weights=weights,
             writer=writer,
             augmentation_roles=args.augmentation_roles,
+            shape_recolor_strength=args.shape_recolor_strength,
+            color_shuffle_strength=args.color_shuffle_strength,
+            center_zoom_min_scale=args.center_zoom_min_scale,
+            center_zoom_max_scale=args.center_zoom_max_scale,
+            shape_silhouette_strength=args.shape_silhouette_strength,
+            material_relight_strength=args.material_relight_strength,
+            material_specular_strength=args.material_specular_strength,
             upper_lower_mask_split=args.upper_lower_mask_split,
             upper_lower_mask_strength=args.upper_lower_mask_strength,
         )
