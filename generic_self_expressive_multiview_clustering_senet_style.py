@@ -1015,6 +1015,11 @@ def _center_zoom_preserve_color(
         align_corners=False,
     )
 
+def deterministic_median(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    sorted_x = torch.sort(x, dim=dim).values
+    middle = (x.size(dim) - 1) // 2
+    return sorted_x.select(dim, middle)
+
 
 def _soft_centered_object_mask(images: Tensor) -> Tensor:
     """Estimate a soft object mask from its contrast with the image border."""
@@ -1026,7 +1031,7 @@ def _soft_centered_object_mask(images: Tensor) -> Tensor:
     left = images[..., 1:-1, 0]
     right = images[..., 1:-1, -1]
     border = torch.cat((top, bottom, left, right), dim=-1)
-    background = border.median(dim=-1).values[..., None, None]
+    background =  deterministic_median(border, dim=-1)[..., None, None] #border.median(dim=-1).values[..., None, None]
     distance = (images - background).square().mean(dim=1, keepdim=True).sqrt()
     scale = distance.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
     normalized_distance = distance / scale
