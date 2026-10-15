@@ -30,5 +30,6 @@ python3 ./generic_self_expressive_multiview_clustering_senet_style.py --clusters
 --augmentation-roles=upper,lower  \
 --upper-lower-mask-strength=1.0  \
 --tensorboard-log-dir=./outputs/runs_stickfigures/ \
+--loss-weights-config=configs/stickfigures.yaml \
 --dataset-path=data/datasets/enrc_data/stickfigures >> ./outputs/deep_imc_stickfigures_out.txt
 
