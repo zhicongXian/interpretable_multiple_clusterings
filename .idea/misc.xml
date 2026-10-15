@@ -3,4 +3,5 @@
   <component name="Black">
     <option name="sdkName" value="subspace_clustering" />
   </component>
+  <component name="ProjectRootManager" version="2" project-jdk-name="subspace_clustering_env (2)" project-jdk-type="Python SDK" />
 </project>

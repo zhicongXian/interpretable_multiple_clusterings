@@ -22,13 +22,14 @@ export LAPACK=/usr/lib/x86_64-linux-gnu/lapack/liblapack.a
 # train
 python3 ./generic_self_expressive_multiview_clustering_senet_style.py --clusters=6,2,3 \
 --pretrain-epochs=1000 \
---joint-epochs=1000 \
---view-epochs=1000 \
---checkpoint=./outputs/nr_objects_v1.pt \
---visualization=./outputs/nr_objects_v1.html \
+--joint-epochs=2000 \
+--view-epochs=3000 \
+--checkpoint=./outputs/nr_objects_v2.pt \
+--visualization=./outputs/nr_objects_v2.html \
 --dataset=nr_objects \
 --tensorboard-log-dir=./outputs/runs_nr_objects \
 --augmentation-roles=color,shape,material  \
---experiment-name=with_augmentation \
+--experiment-name=with_augmentation_new \
+--loss-weights-config=configs/nr_objects.yaml \
 --dataset-path=data/datasets/enrc_data/nr_objects >> ./outputs/deep_imc_nr_objects_out.txt
 

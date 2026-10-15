@@ -34,7 +34,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -461,6 +461,7 @@ class GenericSelfExpressiveMultiView(nn.Module):
         beta: Tensor | None = None,
     ) -> list[Tensor]:
         beta = self.beta() if beta is None else beta
+        # rotated = rotated.detach()
         return [
             head(rotated, beta[view])
             for view, head in enumerate(self.projection_heads)
@@ -502,7 +503,7 @@ class GenericSelfExpressiveMultiView(nn.Module):
         }
 
 @dataclass # (frozen=True)
-class LossWeightsForAugmentation:
+class LossWeights:
     # Reconstruction is already optimized during pretraining. A smaller joint
     # weight lets clustering reorganize the shared representation.
     reconstruction: float = 1.0
@@ -521,20 +522,88 @@ class LossWeightsForAugmentation:
     embedding_diversity: float = 0.0 # 0.00002
     normalized_cut: float = 0.1 # 0.1
     cluster_assignment_orthogonality: float = 0.05
-@dataclass # (frozen=True)
-class LossWeights:
-    reconstruction: float = 1.0
-    self_expression: float = 0.2
-    coefficient_regularization: float = 0.02
-    stability: float = 0.05
-    independence: float = 0.05
-    projection_overlap: float = 0.02
-    beta_entropy: float = 0.01
-    beta_mass_balance: float = 0.0 #0.2
-    beta_effective_dimension: float = 0.0 #0.05
-    latent_variance: float = 0.05
-    worst_view_temperature: float = 0.1
-    embedding_diversity: float = 0.0 # 0.00002
+    cluster_diversity: float = 0.2
+
+    def __post_init__(self) -> None:
+        for field in fields(self):
+            value = getattr(self, field.name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(
+                    f"Loss weight '{field.name}' must be a number, got "
+                    f"{type(value).__name__}."
+                )
+            value = float(value)
+            if not math.isfinite(value):
+                raise ValueError(f"Loss weight '{field.name}' must be finite.")
+            if value < 0.0:
+                raise ValueError(f"Loss weight '{field.name}' must be nonnegative.")
+            setattr(self, field.name, value)
+
+        if self.worst_view_temperature <= 0.0:
+            raise ValueError("Loss weight 'worst_view_temperature' must be positive.")
+
+    @classmethod
+    def from_yaml(cls, path: str | Path) -> "LossWeights":
+        """Load loss weights from a YAML mapping.
+
+        The YAML file may contain the fields directly or nest them below a
+        ``loss_weights`` key. Missing fields retain their dataclass defaults.
+        Unknown fields are rejected to catch misspelled configuration names.
+        """
+        try:
+            import yaml
+        except ImportError as error:
+            raise RuntimeError(
+                "Loading --loss-weights-config requires PyYAML. "
+                "Install it with 'pip install pyyaml'."
+            ) from error
+
+        config_path = Path(path).expanduser()
+        try:
+            with config_path.open("r", encoding="utf-8") as stream:
+                loaded = yaml.safe_load(stream)
+        except yaml.YAMLError as error:
+            raise ValueError(
+                f"Invalid loss-weight YAML file '{config_path}': {error}"
+            ) from error
+
+        if loaded is None:
+            loaded = {}
+        if not isinstance(loaded, dict):
+            raise TypeError(
+                f"Loss-weight YAML file '{config_path}' must contain a mapping."
+            )
+
+        values = loaded.get("loss_weights", loaded)
+        if not isinstance(values, dict):
+            raise TypeError(
+                f"The 'loss_weights' entry in '{config_path}' must be a mapping."
+            )
+
+        valid_names = {field.name for field in fields(cls)}
+        unknown_names = sorted(set(values) - valid_names)
+        if unknown_names:
+            raise ValueError(
+                f"Unknown loss weight(s) in '{config_path}': "
+                + ", ".join(unknown_names)
+                + ". Valid names are: "
+                + ", ".join(sorted(valid_names))
+            )
+        return cls(**values)
+# @dataclass # (frozen=True)
+# class LossWeights:
+#     reconstruction: float = 1.0
+#     self_expression: float = 0.2
+#     coefficient_regularization: float = 0.02
+#     stability: float = 0.05
+#     independence: float = 0.05
+#     projection_overlap: float = 0.02
+#     beta_entropy: float = 0.01
+#     beta_mass_balance: float = 0.0 #0.2
+#     beta_effective_dimension: float = 0.0 #0.05
+#     latent_variance: float = 0.05
+#     worst_view_temperature: float = 0.1
+#     embedding_diversity: float = 0.0 # 0.00002
 
 
 def _pairwise_hsic(values: Sequence[Tensor]) -> Tensor:
@@ -730,10 +799,12 @@ def multiview_loss(
         ],
         weights.worst_view_temperature,
     )
-    independence = 0.5 * (
-        _pairwise_hsic(outputs["projected_views"])
-        + _pairwise_hsic(outputs["affinities"])#_pairwise_hsic(outputs["affinities"])
-    )
+    # independence = 0.5 * (
+    #     _pairwise_hsic(outputs["projected_views"])
+    #     + _pairwise_hsic(outputs["affinities"])#_pairwise_hsic(outputs["affinities"])
+    # )
+    independence = _pairwise_hsic(outputs["projected_views"])
+    cluster_diversity = _pairwise_hsic_projected_view(outputs["affinities"])
     maximize_latent_diversity = _maximize_latent_diversity(outputs["shared"])
     terms = {
         "reconstruction": F.mse_loss(outputs["reconstruction"], images),
@@ -750,7 +821,8 @@ def multiview_loss(
             outputs["beta"], minimum_effective_dimensions
         ),
         "latent_variance": latent_variance,
-        "embedding_diversity":  maximize_latent_diversity
+        "embedding_diversity":  maximize_latent_diversity,
+        "cluster_diversity": cluster_diversity
     }
     total = sum(getattr(weights, name) * value for name, value in terms.items())
     return total, terms
@@ -912,6 +984,37 @@ def _configure_phase(model: GenericSelfExpressiveMultiView, phase: str) -> None:
 
 ######## 1. for view training add the constrastive loss ########
 
+def augment_grayscale(images, brightness_range=(0.5, 1.5),
+                      keep_three_channels=False):
+    """
+    images: float tensor, shape (3, H, W) or (B, 3, H, W).
+    Returns grayscale images with random brightness.
+    """
+    single_image = images.ndim == 3
+    x = images.unsqueeze(0) if single_image else images
+
+    if x.ndim != 4 or x.shape[1] != 3:
+        raise ValueError("Expected shape (3, H, W) or (B, 3, H, W)")
+    if not x.is_floating_point():
+        raise TypeError("Convert input to float in [0, 1] first")
+
+    # RGB -> grayscale: (B, 3, H, W) -> (B, 1, H, W)
+    weights = x.new_tensor([0.299, 0.587, 0.114]).view(1, 3, 1, 1)
+    gray = (x * weights).sum(dim=1, keepdim=True)
+
+    # Independent brightness factor for each image
+    factors = torch.empty(
+        (x.shape[0], 1, 1, 1), device=x.device, dtype=x.dtype
+    ).uniform_(*brightness_range)
+
+    augmented = (gray * factors).clamp(0, 1)
+
+    if keep_three_channels:
+        augmented = augmented.repeat(1, 3, 1, 1)
+
+    return augmented.squeeze(0) if single_image else augmented
+
+
 def _mild_spatial_augmentation(images: Tensor) -> Tensor:
     """Random flips and small translations that preserve shape and color."""
 
@@ -928,6 +1031,9 @@ def _mild_spatial_augmentation(images: Tensor) -> Tensor:
         (batch_size, 2),
         device=images.device,
     )
+
+    # but now change different illumination
+
     return torch.stack(
         [
             torch.roll(
@@ -1413,7 +1519,7 @@ def multiview_loss_with_augmentation(
     images: Tensor,
     outputs: dict[str, Any],
     *,
-    weights: LossWeightsForAugmentation,
+    weights: LossWeights,
     n_clusters: Sequence[int],
     minimum_effective_dimensions: float,
     augmented: tuple[dict[str, Any], dict[str, Any]] | None = None,
@@ -1469,11 +1575,12 @@ def multiview_loss_with_augmentation(
         ],
         weights.worst_view_temperature,
     )
-    independence = 0.5 * (
-        _pairwise_hsic(outputs["projected_views"])
-        + _pairwise_hsic(outputs["affinities"])
-    )
-
+    # independence = 0.5 * (
+    #     _pairwise_hsic(outputs["projected_views"])
+    #     + _pairwise_hsic(outputs["affinities"])
+    # )
+    independence = _pairwise_hsic(outputs["projected_views"])
+    cluster_diversity = _pairwise_hsic_projected_view(outputs["affinities"])
     maximize_latent_diversity = _maximize_latent_diversity(outputs["shared"])
     normalized_cut, cluster_assignment_orthogonality = (
         differentiable_normalized_cut_losses(
@@ -1504,7 +1611,8 @@ def multiview_loss_with_augmentation(
             outputs["beta"], minimum_effective_dimensions
         ),
         "latent_variance": latent_variance,
-        "embedding_diversity": maximize_latent_diversity
+        "embedding_diversity": maximize_latent_diversity,
+        "cluster_diversity": cluster_diversity
     }
     total = sum(getattr(weights, name) * value for name, value in terms.items())
     return total, terms
@@ -1519,7 +1627,7 @@ def train_phase(
     noise_std: float,
     minimum_effective_dimensions: float,
     device: torch.device,
-    weights: LossWeightsForAugmentation,
+    weights: LossWeights,
     writer: Any | None,
     augmentation_roles=None,
     shape_recolor_strength = 0.6,
@@ -1531,23 +1639,22 @@ def train_phase(
     material_specular_strength: float = 0.3,
     upper_lower_mask_split: float = 0.5,
     upper_lower_mask_strength: float = 1.0,
-) -> list[dict[str, float]]:
+) -> tuple[list[dict[str, float]], torch.optim.Optimizer]:
+
     _configure_phase(model, phase)
+    if phase == "joint":
+        weights.reconstruction = 0.5*weights.normalized_cut # --TODO important
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(parameters, lr=learning_rate, weight_decay=1e-4)
     history: list[dict[str, float]] = []
 
-    early_stopper = EarlyStopper(patience=70, min_delta=0.005, decimals=10)
+    early_stopper = EarlyStopper(patience=200, min_delta=0.005, decimals=10)
     for epoch in range(1, epochs + 1):
         model.train()
         sums: dict[str, float] = {"total": 0.0}
         count = 0
         # This term stays disabled in every phase. View independence is already
         # enforced explicitly; dispersing the shared embedding is not needed.
-        if phase=="view":
-            weights.embedding_diversity = 0.0 #0.01
-        else:
-            weights.embedding_diversity = 0.0
 
         for images, _ in loader:
             images = images.to(device)
@@ -1559,27 +1666,27 @@ def train_phase(
             right = (images + noise_std * torch.randn_like(images)).clamp(0, 1)
             optimizer.zero_grad(set_to_none=True)
             outputs = model(images)
-            if phase == "view" or phase == "joint":
-                if augmentation_roles is None:
-                    left = (images + noise_std * torch.randn_like(images)).clamp(0, 1)
-                    right = (images + noise_std * torch.randn_like(images)).clamp(0, 1)
-                    augmented = (model(left), model(right))
-                else:
-                    augmented = view_specific_augmented_outputs(
-                        model,
-                        images,
-                        augmentation_roles,
-                        noise_std=noise_std,
-                        shape_recolor_strength=shape_recolor_strength,
-                        color_shuffle_strength=color_shuffle_strength,
-                        center_zoom_min_scale=center_zoom_min_scale,
-                        center_zoom_max_scale=center_zoom_max_scale,
-                        shape_silhouette_strength=shape_silhouette_strength,
-                        material_relight_strength=material_relight_strength,
-                        material_specular_strength=material_specular_strength,
-                        upper_lower_mask_split=upper_lower_mask_split,
-                        upper_lower_mask_strength=upper_lower_mask_strength,
-                    )
+
+            if augmentation_roles is None:
+                left = (images + noise_std * torch.randn_like(images)).clamp(0, 1)
+                right = (images + noise_std * torch.randn_like(images)).clamp(0, 1)
+                augmented = (model(left), model(right))
+            else:
+                augmented = view_specific_augmented_outputs(
+                    model,
+                    images,
+                    augmentation_roles,
+                    noise_std=noise_std,
+                    shape_recolor_strength=shape_recolor_strength,
+                    color_shuffle_strength=color_shuffle_strength,
+                    center_zoom_min_scale=center_zoom_min_scale,
+                    center_zoom_max_scale=center_zoom_max_scale,
+                    shape_silhouette_strength=shape_silhouette_strength,
+                    material_relight_strength=material_relight_strength,
+                    material_specular_strength=material_specular_strength,
+                    upper_lower_mask_split=upper_lower_mask_split,
+                    upper_lower_mask_strength=upper_lower_mask_strength,
+                )
 
                 total, terms = multiview_loss_with_augmentation(
                     images,
@@ -1589,14 +1696,7 @@ def train_phase(
                     minimum_effective_dimensions=minimum_effective_dimensions,
                     augmented=augmented,
                 )
-            else:
-                total, terms = multiview_loss(
-                    images,
-                    outputs,
-                    weights=weights,
-                    minimum_effective_dimensions=minimum_effective_dimensions,
-                    augmented=(model(left), model(right)),
-                )
+
             if not bool(torch.isfinite(total)):
                 nonfinite_terms = [
                     name for name, value in terms.items()
@@ -1642,6 +1742,7 @@ def train_phase(
         details = " ".join(f"{name}={value:.5f}" for name, value in metrics.items())
         print(f"{phase} epoch {epoch:03d}/{epochs:03d} {details}")
         if early_stopper.early_stop(metrics['total']):
+            print(f"Early stopping")
             break
         if writer is not None:
             for name, value in metrics.items():
@@ -1684,7 +1785,7 @@ def train_phase(
                     epoch,
                 )
     _configure_phase(model, "joint")
-    return history
+    return history, optimizer
 
 
 @torch.no_grad()
@@ -2070,14 +2171,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--normalized-cut-weight",
         type=float,
-        default=0.1,
-        help="Weight of the differentiable normalized MinCut loss.",
+        default=None,
+        help=(
+            "Optional CLI override for the normalized MinCut loss weight. "
+            "Overrides --loss-weights-config."
+        ),
     )
     parser.add_argument(
         "--cluster-orthogonality-weight",
         type=float,
-        default=0.05,
-        help="Weight preventing collapsed or uniform cluster assignments.",
+        default=None,
+        help=(
+            "Optional CLI override for the cluster-assignment orthogonality "
+            "weight. Overrides --loss-weights-config."
+        ),
     )
     parser.add_argument("--spectral-neighbors", type=int, default=20)
     parser.add_argument("--minimum-effective-dimensions", type=float, default=None)
@@ -2146,7 +2253,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tensorboard-log-dir", type=Path, default=None)
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-test-samples", type=int, default=None)
-    parser.add_argument("--sample-index", type=int, default=0)
+    parser.add_argument("--sample-index", type=int, default=None)
     parser.add_argument("--experiment-name", type=str, default="v1")
     parser.add_argument(
         "--visualization", type=Path, default=Path("generic_multiview_views_soft_nmi_aug.html")
@@ -2158,6 +2265,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--no-show", action="store_true")
     parser.add_argument("--inference", action="store_true")
+
+    parser.add_argument(
+        "--loss-weights-config",
+        type=Path,
+        default=None,
+        help=(
+            "YAML file containing LossWeights fields, either as a top-level "
+            "mapping or below a 'loss_weights' key. Missing fields use defaults."
+        ),
+    )
 
     parser.add_argument(
         "--augmentation-roles",
@@ -2172,7 +2289,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
-    parser.add_argument("--augmentation-consistency", type=float, default=100)
+    parser.add_argument(
+        "--augmentation-consistency",
+        type=float,
+        default=None,
+        help=(
+            "Optional CLI override for the augmentation-consistency loss "
+            "weight. Overrides --loss-weights-config."
+        ),
+    )
     return parser.parse_args()
 
 def same_seeds(seed):
@@ -2202,12 +2327,28 @@ def run(args: argparse.Namespace) -> None:
     datasets_list = ["synthetic_shape_color", "nr_objects", "stickfigures"]
     assert args.dataset.lower() in datasets_list, "Only {} are supported".format(','.join(datasets_list))
     same_seeds(args.seed)
+    weights = (
+        LossWeights.from_yaml(args.loss_weights_config)
+        if args.loss_weights_config is not None
+        else LossWeights()
+    )
+    cli_weight_overrides = {
+        "normalized_cut": args.normalized_cut_weight,
+        "cluster_assignment_orthogonality": args.cluster_orthogonality_weight,
+        "augmentation_consistency": args.augmentation_consistency,
+    }
+    weights = replace(
+        weights,
+        **{
+            name: value
+            for name, value in cli_weight_overrides.items()
+            if value is not None
+        },
+    )
     if min(args.pretrain_epochs, args.view_epochs, args.joint_epochs) < 0:
         raise ValueError("Epoch counts must be nonnegative.")
     if args.cluster_assignment_temperature <= 0.0:
         raise ValueError("cluster-assignment-temperature must be positive.")
-    if min(args.normalized_cut_weight, args.cluster_orthogonality_weight) < 0.0:
-        raise ValueError("Normalized-cut loss weights must be nonnegative.")
     if args.view_names is not None and len(args.view_names) != len(args.clusters):
         raise ValueError("view-names and clusters must have the same length.")
     if not 0.0 < args.upper_lower_mask_split < 1.0:
@@ -2308,11 +2449,6 @@ def run(args: argparse.Namespace) -> None:
         if args.minimum_effective_dimensions is not None
         else max(2.0, model.latent_dim / (2.0 * model.n_views))
     )
-    weights = LossWeightsForAugmentation(
-        normalized_cut=args.normalized_cut_weight,
-        cluster_assignment_orthogonality=args.cluster_orthogonality_weight,
-        augmentation_consistency=args.augmentation_consistency
-    )
     writer = _make_writer(args.tensorboard_log_dir)
     try:
         pretrain_history = pretrain_autoencoder(
@@ -2359,7 +2495,7 @@ def run(args: argparse.Namespace) -> None:
             n_neighbors=args.spectral_neighbors,
             random_state=args.seed,
         )
-        view_history = train_phase(
+        view_history, optimizer = train_phase(
             model,
             train_loader,
             phase="view",
@@ -2391,7 +2527,7 @@ def run(args: argparse.Namespace) -> None:
             n_neighbors=args.spectral_neighbors,
             random_state=args.seed,
         )
-        joint_history = train_phase(
+        joint_history, optimizer = train_phase(
             model,
             train_loader,
             phase="joint",
@@ -2423,11 +2559,15 @@ def run(args: argparse.Namespace) -> None:
             random_state=args.seed,
         )
         test_images, _ = next(iter(test_loader))
-        if not 0 <= args.sample_index < len(test_images):
+        if args.sample_index is not None:
+            sample_index = args.sample_index
+        else:
+            sample_index = np.random.randint(0, len(test_images)-1)
+        if not 0 <= sample_index < len(test_images):
             raise IndexError("sample-index is outside the first test batch.")
         visualize_views(
             model,
-            test_images[args.sample_index : args.sample_index + 1],
+            test_images[sample_index : sample_index+ 1],
             output_file=args.visualization,
             show=not args.no_show,
         )
@@ -2442,6 +2582,7 @@ def run(args: argparse.Namespace) -> None:
                 "view_history": view_history,
                 "joint_history": joint_history,
                 "test_metrics": test_metrics,
+                "optimizer_state_dict": optimizer.state_dict(),
             },
             args.checkpoint,
         )
@@ -2451,25 +2592,41 @@ def run(args: argparse.Namespace) -> None:
             writer.close()
 
 def inference(args: argparse.Namespace):
-    same_seeds(args.seed)
+    # same_seeds(args.seed)
     checkpoint = torch.load(
         args.checkpoint,
         map_location="cpu",
         weights_only=False,
     )
 
-    train_data = _limited(
-        NpzImageDataset(args.dataset, "train"), args.max_train_samples, args.seed
-    )
-    test_data = _limited(
-        NpzImageDataset(args.dataset, "test"), args.max_test_samples, args.seed + 1
-    )
-    train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True)
-    test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=False)
+    if args.dataset.lower() == "stickfigures" and args.augmentation_roles is None:
+        if len(args.clusters) != 2:
+            raise ValueError(
+                "Automatic stick-figure augmentation requires exactly two views. "
+                "Otherwise provide --augmentation-roles explicitly."
+            )
+        args.augmentation_roles = ("upper", "lower")
+    if (
+            args.augmentation_roles is not None
+            and len(args.augmentation_roles) != len(args.clusters)
+    ):
+        raise ValueError("Provide exactly one augmentation role for every view.")
+    # set_seed(args.seed)
+    if args.dataset.lower() == "synthetic_shape_color":
+        train_loader, test_loader = get_dataloaders_for_synthetic_shape_color(args)
+    elif args.dataset.lower() == "nr_objects":
+        # here comes the nr-objects loading
+        train_loader, test_loader = load_nr_objects(args)
+    elif args.dataset.lower() == "stickfigures":
+        train_loader, test_loader = load_stickfigures(args)
+    else:
+        raise ValueError("dataset must be either 'synthetic' or 'nr_objects'.")
+
     sample_images, _ = next(iter(train_loader))
     device = torch.device(
         "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
     )
+
     model = GenericSelfExpressiveMultiView(
         sample_images.shape[1:],
         args.clusters,
@@ -2502,12 +2659,17 @@ def inference(args: argparse.Namespace):
         random_state=args.seed,
         )
     test_images, _ = next(iter(test_loader))
-    if not 0 <= args.sample_index < len(test_images):
-        raise IndexError("sample-index is outside the first test batch.")
-    random.seed(args.seed)
+
+    # random.seed(args.seed)
 
     # Inclusive: can return 1 through 10
-    sample_index = random.randint(0, len(test_loader) - 1)
+    if args.sample_index is None:
+        sample_index = random.randint(0, len(test_loader) - 1)
+    else:
+        sample_index = args.sample_index
+    if not 0 <= sample_index < len(test_images):
+        raise IndexError("sample-index is outside the first test batch.")
+    print(f"sample index:{sample_index}")
     visualize_views(
         model,
         test_images[sample_index : sample_index + 1],
