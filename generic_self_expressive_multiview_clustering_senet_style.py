@@ -2186,6 +2186,30 @@ def parse_args() -> argparse.Namespace:
             "weight. Overrides --loss-weights-config."
         ),
     )
+
+    parser.add_argument(
+        "--reconstruction-weight",
+        type=float,
+        default=None,
+        help=(
+            "Optional CLI override for the reconstruction loss weight. "
+            "weight. Overrides --loss-weights-config."
+        ),
+
+    )
+
+    parser.add_argument(
+        "--cluster-diversity-weight",
+        type=float,
+        default=None,
+        help=(
+            "Optional CLI override for the cluster diversity loss weight. "
+            "weight. Overrides --loss-weights-config."
+        ),
+        required=False,
+    )
+
+
     parser.add_argument("--spectral-neighbors", type=int, default=20)
     parser.add_argument("--minimum-effective-dimensions", type=float, default=None)
     parser.add_argument("--pretrain-epochs", type=int, default=200)
@@ -2336,6 +2360,8 @@ def run(args: argparse.Namespace) -> None:
         "normalized_cut": args.normalized_cut_weight,
         "cluster_assignment_orthogonality": args.cluster_orthogonality_weight,
         "augmentation_consistency": args.augmentation_consistency,
+        "reconstruction": args.reconstruction_weight,
+        "cluster_diversity": args.cluster_diversity_weight,
     }
     weights = replace(
         weights,
