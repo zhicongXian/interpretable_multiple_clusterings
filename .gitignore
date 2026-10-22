@@ -3,3 +3,6 @@ data/datasets/
 data/__pycache__/
 utils/__pycache__/
 .idea
+wandb
+models/__pycache__
+utils/__pycache__
