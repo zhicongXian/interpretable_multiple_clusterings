@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-#SBATCH --job-name=deep_imc_nr_objects
+#SBATCH --job-name=deep_imc_nr_objects_sweep
 #SBATCH --output=./outputs/deep_imc_nr_objects.txt
 #SBATCH --ntasks=1
 #SBATCH --time=10-00:00:00
@@ -31,5 +31,7 @@ python3 ./generic_self_expressive_multiview_clustering_senet_style_wandb.py --cl
 --augmentation-roles=color,shape,material  \
 --experiment-name=with_augmentation_sweep \
 --loss-weights-config=configs/nr_objects.yaml \
+--wandb-sweep
+--wandb-entity="olegtolochko-ludwig-maximilianuniversity-of-munich"
 --dataset-path=data/datasets/enrc_data/nr_objects >> ./outputs/deep_imc_nr_objects_out.txt
 
