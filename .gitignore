@@ -6,3 +6,4 @@ utils/__pycache__/
 wandb
 models/__pycache__
 utils/__pycache__
+results

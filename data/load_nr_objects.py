@@ -13,7 +13,7 @@ import torch
 from collections import OrderedDict
 
 import torchvision.transforms as transforms
-
+from torchvision import transforms
 """
 Code adapted from https://github.com/mesnico/RelationNetworks-CLEVR/edit/master/clevr_dataset_connector.py
 to parse the json files easily.
@@ -28,6 +28,21 @@ used_classes = OrderedDict({
     'size': ['large'],
 })
 
+class TransformDataset(Dataset):
+    def __init__(self, dataset, transform=None):
+        self.dataset = dataset
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        x, y = self.dataset[index]
+
+        if self.transform is not None:
+            x = self.transform(x)
+
+        return x, y
 
 def load_json(scene_path):
     with open(scene_path) as json_file:
@@ -210,7 +225,21 @@ def load_nr_objects(args):
     pt_labels = pt_labels[:, [1, 2, 3]]
     pt_data = pt_data.view((-1, 3, 128, 128))
     bs = 8
-    testloader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(*(pt_data, torch.from_numpy(pt_labels))),
+
+
+
+    tfms = [
+        transforms.RandomApply(
+            [transforms.ColorJitter(brightness=0.2)],
+            p=0.75,
+        ),
+        transforms.RandomApply(
+            [transforms.ColorJitter(contrast=0.2)],
+            p=0.75,
+        ),
+    ]
+    base_dataset = torch.utils.data.TensorDataset(*(pt_data, torch.from_numpy(pt_labels)))
+    testloader = torch.utils.data.DataLoader(TransformDataset(base_dataset, transform=tfms),
                                              batch_size=args.batch_size,
                                              shuffle=False,
                                              drop_last=False,
@@ -219,7 +248,7 @@ def load_nr_objects(args):
 
 
 
-    trainloader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(*(pt_data, torch.from_numpy(pt_labels))),
+    trainloader = torch.utils.data.DataLoader(TransformDataset(base_dataset, transform=tfms),
                                               batch_size=args.batch_size,
                                               shuffle=True,
                                               drop_last=True, num_workers=0, pin_memory=True)

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-#SBATCH --job-name=deep_imc_nr_objects
-#SBATCH --output=./outputs/deep_imc_nr_objects.txt
+#SBATCH --job-name=deep_imc_nr_objects_single
+#SBATCH --output=./outputs/deep_imc_nr_objects_single.txt
 #SBATCH --ntasks=1
 #SBATCH --time=10-00:00:00
 #SBATCH --gres=gpu:1
@@ -24,6 +24,7 @@ python3 ./generic_self_expressive_multiview_clustering_senet_style.py --clusters
 --pretrain-epochs=1000 \
 --joint-epochs=2000 \
 --view-epochs=3000 \
+batch-size=1024 \
 --checkpoint=./outputs/nr_objects_v2.pt \
 --visualization=./outputs/nr_objects_v2.html \
 --dataset=nr_objects \
@@ -31,5 +32,5 @@ python3 ./generic_self_expressive_multiview_clustering_senet_style.py --clusters
 --augmentation-roles=color,shape,material  \
 --experiment-name=with_augmentation_new \
 --loss-weights-config=configs/nr_objects.yaml \
---dataset-path=data/datasets/enrc_data/nr_objects >> ./outputs/deep_imc_nr_objects_out.txt
+--dataset-path=data/datasets/enrc_data/nr_objects >> ./outputs/deep_imc_nr_objects_single_out.txt
 
