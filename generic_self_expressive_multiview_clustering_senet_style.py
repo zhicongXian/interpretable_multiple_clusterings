@@ -523,6 +523,7 @@ class LossWeights:
     normalized_cut: float = 0.1 # 0.1
     cluster_assignment_orthogonality: float = 0.05
     cluster_diversity: float = 0.2
+    affinity_diversity: float = 0.2
 
     def __post_init__(self) -> None:
         for field in fields(self):
@@ -686,6 +687,17 @@ def _pairwise_hsic_projected_view(values: Sequence[Tensor], eps = 1.0 ) -> Tenso
         ]
     ).mean()
 
+def _pairwise_cluster_diversity(values: Sequence[Tensor], eps = 1.0 ) -> Tensor:
+    if len(values) < 2:
+        return values[0].new_zeros(())
+
+    return torch.stack(
+        [
+            soft_nmi(left, right, from_logits=False) # total_coding_rate(left, right)
+            for left, right in itertools.combinations(values, 2)
+        ]
+    ).mean()
+
 def soft_nmi(
     zi: torch.Tensor,
     zj: torch.Tensor,
@@ -804,7 +816,8 @@ def multiview_loss(
     #     + _pairwise_hsic(outputs["affinities"])#_pairwise_hsic(outputs["affinities"])
     # )
     independence = _pairwise_hsic(outputs["projected_views"])
-    cluster_diversity = _pairwise_hsic_projected_view(outputs["affinities"])
+    cluster_diversity = _pairwise_cluster_diversity(outputs["soft_assignments"])
+    affinity_diversity = _pairwise_hsic_projected_view(outputs["affinities"])
     maximize_latent_diversity = _maximize_latent_diversity(outputs["shared"])
     terms = {
         "reconstruction": F.mse_loss(outputs["reconstruction"], images),
@@ -822,7 +835,8 @@ def multiview_loss(
         ),
         "latent_variance": latent_variance,
         "embedding_diversity":  maximize_latent_diversity,
-        "cluster_diversity": cluster_diversity
+        "cluster_diversity": cluster_diversity,
+        "affinity_diversity": affinity_diversity
     }
     total = sum(getattr(weights, name) * value for name, value in terms.items())
     return total, terms
@@ -1580,7 +1594,9 @@ def multiview_loss_with_augmentation(
     #     + _pairwise_hsic(outputs["affinities"])
     # )
     independence = _pairwise_hsic(outputs["projected_views"])
-    cluster_diversity = _pairwise_hsic_projected_view(outputs["affinities"])
+    cluster_diversity = _pairwise_cluster_diversity(outputs["soft_assignments"])
+    affinity_diversity = _pairwise_hsic_projected_view(outputs["affinities"])
+
     maximize_latent_diversity = _maximize_latent_diversity(outputs["shared"])
     normalized_cut, cluster_assignment_orthogonality = (
         differentiable_normalized_cut_losses(
@@ -1612,7 +1628,8 @@ def multiview_loss_with_augmentation(
         ),
         "latent_variance": latent_variance,
         "embedding_diversity": maximize_latent_diversity,
-        "cluster_diversity": cluster_diversity
+        "cluster_diversity": cluster_diversity,
+        "affinity_diversity":affinity_diversity,
     }
     total = sum(getattr(weights, name) * value for name, value in terms.items())
     return total, terms
@@ -2208,7 +2225,16 @@ def parse_args() -> argparse.Namespace:
         ),
         required=False,
     )
-
+    parser.add_argument(
+        "--affinity-diversity-weight",
+        type=float,
+        default=None,
+        help=(
+            "Optional CLI override for the cluster diversity loss weight. "
+            "weight. Overrides --loss-weights-config."
+        ),
+        required=False,
+    )
 
     parser.add_argument("--spectral-neighbors", type=int, default=20)
     parser.add_argument("--minimum-effective-dimensions", type=float, default=None)
@@ -2362,6 +2388,7 @@ def run(args: argparse.Namespace) -> None:
         "augmentation_consistency": args.augmentation_consistency,
         "reconstruction": args.reconstruction_weight,
         "cluster_diversity": args.cluster_diversity_weight,
+        "affinity_diversity": args.affinity_diversity_weight,
     }
     weights = replace(
         weights,

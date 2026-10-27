@@ -16,3 +16,4 @@ loss_weights:
     normalized_cut:  1.0 # 0.1
     cluster_assignment_orthogonality:  0.05
     cluster_diversity: 0.2
+    affinity_diversity: 0.2
