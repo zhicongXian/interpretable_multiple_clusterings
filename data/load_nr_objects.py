@@ -239,7 +239,7 @@ def load_nr_objects(args):
         ),
     ])
     base_dataset = torch.utils.data.TensorDataset(*(pt_data, torch.from_numpy(pt_labels)))
-    testloader = torch.utils.data.DataLoader(TransformDataset(base_dataset, transform=tfms),
+    testloader = torch.utils.data.DataLoader(TransformDataset(base_dataset, transform ),
                                              batch_size=args.batch_size,
                                              shuffle=False,
                                              drop_last=False,

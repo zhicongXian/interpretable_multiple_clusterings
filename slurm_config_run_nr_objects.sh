@@ -5,7 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --time=10-00:00:00
 #SBATCH --gres=gpu:1
-#SBATCH --mem=128G
+#SBATCH --mem=256G
 
 # debug info
 hostname
@@ -24,7 +24,7 @@ python3 ./generic_self_expressive_multiview_clustering_senet_style.py --clusters
 --pretrain-epochs=1000 \
 --joint-epochs=2000 \
 --view-epochs=3000 \
---batch-size=1024 \
+--batch-size=512 \
 --checkpoint=./outputs/nr_objects_v3.pt \
 --visualization=./outputs/nr_objects_v3.html \
 --dataset=nr_objects \
