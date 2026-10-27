@@ -228,7 +228,7 @@ def load_nr_objects(args):
 
 
 
-    tfms = [
+    tfms = transforms.Compose( [
         transforms.RandomApply(
             [transforms.ColorJitter(brightness=0.2)],
             p=0.75,
@@ -237,7 +237,7 @@ def load_nr_objects(args):
             [transforms.ColorJitter(contrast=0.2)],
             p=0.75,
         ),
-    ]
+    ])
     base_dataset = torch.utils.data.TensorDataset(*(pt_data, torch.from_numpy(pt_labels)))
     testloader = torch.utils.data.DataLoader(TransformDataset(base_dataset, transform=tfms),
                                              batch_size=args.batch_size,
