@@ -167,7 +167,6 @@ def load_cmnist(args):
 
     src_path = args.dataset_path # "C:\\Users\\zhicong\\Documents\\Data\\enrc_data\\enrc_data\\nr_objects"
     # args.dataset_path = clevr_dir
-    image_mode = args.image_mode
     use_gpu = True
     bs = 64
     stats_bs = 64

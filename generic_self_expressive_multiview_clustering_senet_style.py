@@ -2429,7 +2429,7 @@ def get_dataloaders_for_synthetic_shape_color(args):
     return train_loader, test_loader
 
 def run(args: argparse.Namespace) -> None:
-    datasets_list = ["synthetic_shape_color", "nr_objects", "stickfigures"]
+    datasets_list = ["synthetic_shape_color", "nr_objects", "stickfigures", "cmnist", "gtsrb"]
     assert args.dataset.lower() in datasets_list, "Only {} are supported".format(','.join(datasets_list))
     same_seeds(args.seed)
     weights = (
