@@ -14,6 +14,10 @@ from collections import OrderedDict
 
 import torchvision.transforms as transforms
 from torchvision import transforms
+
+import argparse
+from pathlib import Path
+
 """
 Code adapted from https://github.com/mesnico/RelationNetworks-CLEVR/edit/master/clevr_dataset_connector.py
 to parse the json files easily.
@@ -196,12 +200,12 @@ class ClevrDatasetImagesAndDescriptions(Dataset):
 
         return image, labels
 
-def load_nr_objects(args):
-    CONCAT_LABELS = True
+def load_nr_objects(args,CONCAT_LABELS = True,nr_of_images = 10000):
+
 
     clevr_dir = args.dataset_path #"C:\\Users\\zhicong\\Documents\\Data\\enrc_data\\enrc_data\\nr_objects"
     # args.dataset_path = clevr_dir
-    nr_of_images = 10000
+
     if CONCAT_LABELS:
         concat_json = generate_scenes(os.path.join(
             clevr_dir, "scenes"), nr_of_images=nr_of_images)
@@ -209,26 +213,27 @@ def load_nr_objects(args):
             clevr_dir, "scenes", "CLEVR_train_scenes.json"))
     std = (0.1263, 0.1241, 0.1253)
     mean = (0.4490, 0.4362, 0.4286)
-    transform = transforms.Compose([# transforms.ToTensor(), #  the input is already a tensor
+    read_transform = transforms.Compose([transforms.ToTensor(), #  the input is already a tensor
+
+                                    ])
+    train_transform = transforms.Compose([
                                     transforms.Normalize(mean,
                                                          std),
                                     ])
     trainset = ClevrDatasetImagesAndDescriptions(clevr_dir=clevr_dir,
                                                             train=True,
-                                                            transform=transform,
+                                                            transform=read_transform,
                                                             use_cached=False,
                                                             classes=used_classes,
-                                                            )
+                                                            ) # transform PIL to pytorch tensor
 
-    pt_data, pt_labels = trainset.get_pt_data(N=nr_of_images)
+    pt_data, pt_labels = trainset.get_pt_data(N=nr_of_images) #  collect all the data points and reshape
     # Drop size label, because it is only one class "large"
-    pt_labels = pt_labels[:, [1, 2, 3]]
+    pt_labels = pt_labels[:, [1, 2, 3]] # mainly for sorting the labels
     pt_data = pt_data.view((-1, 3, 128, 128))
-    bs = 8
 
+    pretrain_transform = transforms.Compose( [
 
-
-    tfms = transforms.Compose( [
         transforms.RandomApply(
             [transforms.ColorJitter(brightness=0.2)],
             p=0.75,
@@ -237,63 +242,49 @@ def load_nr_objects(args):
             [transforms.ColorJitter(contrast=0.2)],
             p=0.75,
         ),
-    ])
+        transforms.Normalize(mean,
+                             std),
+
+    ]) # this is the transformation required for pretraining
+
     base_dataset = torch.utils.data.TensorDataset(*(pt_data, torch.from_numpy(pt_labels)))
-    testloader = torch.utils.data.DataLoader(TransformDataset(base_dataset, transform ),
+    trainloader = torch.utils.data.DataLoader(TransformDataset(base_dataset, train_transform),
                                              batch_size=args.batch_size,
                                              shuffle=False,
                                              drop_last=False,
                                              pin_memory=True,
                                              num_workers=0)
+    testloader = trainloader
 
 
 
-    trainloader = torch.utils.data.DataLoader(TransformDataset(base_dataset, transform=tfms),
+    pretrain_dataloader = torch.utils.data.DataLoader(TransformDataset(base_dataset, pretrain_transform),
                                               batch_size=args.batch_size,
                                               shuffle=True,
                                               drop_last=True, num_workers=0, pin_memory=True)
 
-    return trainloader, testloader
+    return pretrain_dataloader, trainloader, testloader
+
+
+
 if __name__ == "__main__":
     CONCAT_LABELS = False
 
-    clevr_dir = "C:\\Users\\zhicong\\Documents\\Data\\enrc_data\\enrc_data\\nr_objects"
-    nr_of_images = 100 # 10000
-    if CONCAT_LABELS:
-        concat_json = generate_scenes(os.path.join(
-            clevr_dir, "scenes"), nr_of_images=nr_of_images)
-        save_json(concat_json, os.path.join(
-            clevr_dir, "scenes", "CLEVR_train_scenes.json"))
-    std = (0.1263, 0.1241, 0.1253)
-    mean = (0.4490, 0.4362, 0.4286)
-    transform = transforms.Compose([transforms.ToTensor(),
-                                    transforms.Normalize(mean,
-                                                         std),
-                                    ])
-    trainset = ClevrDatasetImagesAndDescriptions(clevr_dir=clevr_dir,
-                                                            train=True,
-                                                            transform=transform,
-                                                            use_cached=False,
-                                                            classes=used_classes,
-                                                            )
 
-    pt_data, pt_labels = trainset.get_pt_data(N=nr_of_images)
-    # Drop size label, because it is only one class "large"
-    pt_labels = pt_labels[:, [1, 2, 3]]
-    pt_data = pt_data.view((-1, 3, 128, 128))
-    bs = 8
-    testloader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(*(pt_data, torch.from_numpy(pt_labels))), batch_size=bs,
-                                             shuffle=False,
-                                             drop_last=False,
-                                             pin_memory=True,
-                                             num_workers=0)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--dataset-path", type=Path, default=r"C:\Users\erikc\Documents\Data\enrc_data\enrc_data\nr_objects\tmp")
 
+    args = parser.parse_args()
+    pretrain_loader, trainloader, testloader = load_nr_objects(args, False, 63)
 
-
-    trainloader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(*(pt_data, torch.from_numpy(pt_labels))),
-                                              batch_size=bs,
-                                              shuffle=True,
-                                              drop_last=True, num_workers=0, pin_memory=True)
+    for data, label in pretrain_loader:
+        print(f"data: {data}, label: {label}")
 
     for data, label in trainloader:
         print(f"data: {data}, label: {label}")
+
+
+    for data, label in testloader:
+        print(f"data: {data}, label: {label}")
+

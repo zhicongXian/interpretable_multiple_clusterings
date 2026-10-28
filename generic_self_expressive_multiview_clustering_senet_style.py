@@ -2463,15 +2463,18 @@ def run(args: argparse.Namespace) -> None:
     ):
         raise ValueError("Provide exactly one augmentation role for every view.")
     set_seed(args.seed)
+    pretrain_dataloader = None
     if args.dataset.lower() == "synthetic_shape_color":
         train_loader, test_loader = get_dataloaders_for_synthetic_shape_color(args)
     elif args.dataset.lower() == "nr_objects":
         # here comes the nr-objects loading
-        train_loader, test_loader = load_nr_objects(args)
+        pretrain_dataloader,  train_loader, test_loader = load_nr_objects(args)
     elif args.dataset.lower() == "stickfigures":
         train_loader, test_loader = load_stickfigures(args)
     else:
         raise ValueError("dataset must be either 'synthetic' or 'nr_objects'.")
+    if pretrain_dataloader is None:
+        pretrain_dataloader = train_loader
 
 
     sample_images, _ = next(iter(train_loader))
@@ -2504,15 +2507,17 @@ def run(args: argparse.Namespace) -> None:
     )
     writer = _make_writer(args.tensorboard_log_dir)
     try:
+
         pretrain_history = pretrain_autoencoder(
             model,
-            train_loader,
+            pretrain_dataloader,
             epochs=args.pretrain_epochs,
             learning_rate=args.pretrain_learning_rate,
             noise_std=args.noise_std,
             device=device,
             writer=writer,
         )
+
         # save latent embeddings after pretraining:
         train_x = []
         train_idx = []
