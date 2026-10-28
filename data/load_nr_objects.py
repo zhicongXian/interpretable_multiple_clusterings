@@ -209,7 +209,7 @@ def load_nr_objects(args):
             clevr_dir, "scenes", "CLEVR_train_scenes.json"))
     std = (0.1263, 0.1241, 0.1253)
     mean = (0.4490, 0.4362, 0.4286)
-    transform = transforms.Compose([transforms.ToTensor(),
+    transform = transforms.Compose([# transforms.ToTensor(), #  the input is already a tensor
                                     transforms.Normalize(mean,
                                                          std),
                                     ])
