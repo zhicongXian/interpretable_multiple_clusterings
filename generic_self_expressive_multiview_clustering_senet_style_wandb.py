@@ -525,6 +525,7 @@ class LossWeights:
     normalized_cut: float = 0.1 # 0.1
     cluster_assignment_orthogonality: float = 0.05
     cluster_diversity: float = 0.2
+    affinity_diversity: float = 0.2
 
     def __post_init__(self) -> None:
         for field in fields(self):
@@ -2458,17 +2459,19 @@ def run(args: argparse.Namespace, wandb_run: Any | None = None) -> None:
     ):
         raise ValueError("Provide exactly one augmentation role for every view.")
     set_seed(args.seed)
+    pretrain_dataloader = None
     if args.dataset.lower() == "synthetic_shape_color":
         train_loader, test_loader = get_dataloaders_for_synthetic_shape_color(args)
     elif args.dataset.lower() == "nr_objects":
         # here comes the nr-objects loading
-        train_loader, test_loader = load_nr_objects(args)
+        pretrain_dataloader, train_loader, test_loader = load_nr_objects(args)
     elif args.dataset.lower() == "stickfigures":
         train_loader, test_loader = load_stickfigures(args)
     else:
         raise ValueError("dataset must be either 'synthetic' or 'nr_objects'.")
 
-
+    if pretrain_dataloader is None:
+        pretrain_dataloader = train_loader
     sample_images, _ = next(iter(train_loader))
     device = torch.device(
         "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
@@ -2501,7 +2504,7 @@ def run(args: argparse.Namespace, wandb_run: Any | None = None) -> None:
     try:
         pretrain_history = pretrain_autoencoder(
             model,
-            train_loader,
+            pretrain_dataloader,
             epochs=args.pretrain_epochs,
             learning_rate=args.pretrain_learning_rate,
             noise_std=args.noise_std,
@@ -2678,7 +2681,7 @@ def inference(args: argparse.Namespace):
         train_loader, test_loader = get_dataloaders_for_synthetic_shape_color(args)
     elif args.dataset.lower() == "nr_objects":
         # here comes the nr-objects loading
-        train_loader, test_loader = load_nr_objects(args)
+        _, train_loader, test_loader = load_nr_objects(args)
     elif args.dataset.lower() == "stickfigures":
         train_loader, test_loader = load_stickfigures(args)
     else:
@@ -2743,10 +2746,10 @@ def inference(args: argparse.Namespace):
 
 # W&B config names map explicitly to argparse destinations.
 SWEEP_WEIGHT_ARGUMENTS = {
-    "reconstruction_weight": "reconstruction_weight",
+    # "reconstruction_weight": "reconstruction_weight",
     "augmentation_consistency_weight": "augmentation_consistency",
-    "normalized_cut_weight": "normalized_cut_weight",
-    "cluster_diversity_weight": "cluster_diversity_weight",
+    # "normalized_cut_weight": "normalized_cut_weight",
+    # "cluster_diversity_weight": "cluster_diversity_weight",
 }
 
 

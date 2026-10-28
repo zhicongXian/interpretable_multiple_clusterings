@@ -200,11 +200,16 @@ class ClevrDatasetImagesAndDescriptions(Dataset):
 
         return image, labels
 
-def load_nr_objects(args,CONCAT_LABELS = True,nr_of_images = 10000):
+def load_nr_objects(args,CONCAT_LABELS = True):
 
 
     clevr_dir = args.dataset_path #"C:\\Users\\zhicong\\Documents\\Data\\enrc_data\\enrc_data\\nr_objects"
     # args.dataset_path = clevr_dir
+    count = 0
+    for root, dirs, files in os.walk(clevr_dir):
+        count += sum(filename.lower().endswith(".png") for filename in files)
+    nr_of_images = count
+    print(f"Total PNG files: {count}")
 
     if CONCAT_LABELS:
         concat_json = generate_scenes(os.path.join(
@@ -276,7 +281,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset-path", type=Path, default=r"C:\Users\erikc\Documents\Data\enrc_data\enrc_data\nr_objects\tmp")
 
     args = parser.parse_args()
-    pretrain_loader, trainloader, testloader = load_nr_objects(args, False, 63)
+    pretrain_loader, trainloader, testloader = load_nr_objects(args, False)
 
     for data, label in pretrain_loader:
         print(f"data: {data}, label: {label}")

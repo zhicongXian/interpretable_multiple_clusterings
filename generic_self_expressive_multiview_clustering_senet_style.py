@@ -51,6 +51,7 @@ from loss.utils import (beta_effective_dimension_loss, beta_mass_balance_loss,
                         beta_entropy, normalized_linear_hsic,
                         smooth_worst_view, semi_orthogonal_overlap_loss)
 from data.load_nr_objects import load_nr_objects
+from data.load_cmnist import load_cmnist
 from data.load_stickfigures import load_stickfigures
 from utils.general_utils import set_seed
 
@@ -1261,6 +1262,39 @@ def _mask_vertical_region(
     masked = images * keep_mask
     return (1.0 - strength) * images + strength * masked
 
+def _mask_horizontal_region(
+    images: Tensor,
+    region: str,
+    *,
+    split_fraction: float,
+    strength: float,
+) -> Tensor:
+    """Mask the upper or lower image region with the zero/background value.
+
+    ``split_fraction`` is the boundary measured from the top of the image.
+    ``strength=1`` completely removes the selected region, while smaller
+    values blend the original pixels with the masked image.
+    """
+
+    if region not in {"left", "right"}:
+        raise ValueError("region must be either 'left' or 'right'.")
+    if not 0.0 < split_fraction < 1.0:
+        raise ValueError("split_fraction must lie strictly between 0 and 1.")
+    if not 0.0 <= strength <= 1.0:
+        raise ValueError("mask strength must lie in [0, 1].")
+    if images.ndim != 4 or images.shape[-1] < 2:
+        raise ValueError("images must have shape [N, C, H, W] with W >= 2.")
+
+    width = images.shape[-1]
+    split_column = min(max(int(round(width * split_fraction)), 1), width - 1)
+    keep_mask = images.new_ones((1, 1, 1, width))
+    if region == "left":
+        keep_mask[..., :split_column] = 0.0
+    else:
+        keep_mask[..., split_column:] = 0.0
+    masked = images * keep_mask
+    return (1.0 - strength) * images + strength * masked
+
 def augment_for_view(
     images: Tensor,
     role: str,
@@ -1275,6 +1309,8 @@ def augment_for_view(
     material_specular_strength: float = 0.3,
     upper_lower_mask_split: float = 0.5,
     upper_lower_mask_strength: float = 1.0,
+    left_right_mask_split: float = 0.5,
+    left_right_mask_strength: float = 1.0,
 ) -> Tensor:
     """Create an augmentation that removes nuisance information for one view.
 
@@ -1329,6 +1365,23 @@ def augment_for_view(
             split_fraction=upper_lower_mask_split,
             strength=upper_lower_mask_strength,
         )
+    elif role == "left":
+        augmented = images
+        augmented = _mask_horizontal_region(
+            augmented,
+            "left",
+            split_fraction=left_right_mask_split,
+            strength=left_right_mask_strength,
+        )
+    elif role == "right":
+        augmented = images
+        augmented = _mask_horizontal_region(
+            augmented,
+            "right",
+            split_fraction=left_right_mask_split,
+            strength=left_right_mask_strength,
+        )
+
     elif role == "generic":
         augmented = images
     else:
@@ -1947,6 +2000,8 @@ def evaluate_clustering(
         facets=["color", "material", "shape"] # material_objects_colors, i need to get the label information
     elif args.dataset.lower() == "stickfigures":
         facets=["upper", "lower"]
+    elif args.dataset.lower() == "cmnist":
+        facets=["left", "right"]
 
     predictions=np.asarray(predictions)
     labels=np.asarray(labels)
@@ -2432,7 +2487,7 @@ def run(args: argparse.Namespace) -> None:
         args.augmentation_roles = tuple(
             role.lower() for role in args.augmentation_roles
         )
-        allowed_roles = {"color", "shape", "material", "upper", "lower", "generic"}
+        allowed_roles = {"color", "shape", "material", "upper", "lower", "generic","left", "right"}
         unknown_roles = sorted(set(args.augmentation_roles) - allowed_roles)
         if unknown_roles:
             raise ValueError(
@@ -2457,6 +2512,14 @@ def run(args: argparse.Namespace) -> None:
                 "Otherwise provide --augmentation-roles explicitly."
             )
         args.augmentation_roles = ("upper", "lower")
+    if args.dataset.lower() == "cmnist" and args.augmentation_roles is None:
+        if len(args.clusters) != 2:
+            raise ValueError(
+                "Automatic stick-figure augmentation requires exactly two views. "
+                "Otherwise provide --augmentation-roles explicitly."
+            )
+        args.augmentation_roles = ("left", "right")
+
     if (
         args.augmentation_roles is not None
         and len(args.augmentation_roles) != len(args.clusters)
@@ -2469,6 +2532,9 @@ def run(args: argparse.Namespace) -> None:
     elif args.dataset.lower() == "nr_objects":
         # here comes the nr-objects loading
         pretrain_dataloader,  train_loader, test_loader = load_nr_objects(args)
+    elif args.dataset.lower() == "cmnist":
+        # here comes the nr-objects loading
+        pretrain_dataloader, train_loader, test_loader = load_cmnist(args)
     elif args.dataset.lower() == "stickfigures":
         train_loader, test_loader = load_stickfigures(args)
     else:
@@ -2674,7 +2740,10 @@ def inference(args: argparse.Namespace):
         train_loader, test_loader = get_dataloaders_for_synthetic_shape_color(args)
     elif args.dataset.lower() == "nr_objects":
         # here comes the nr-objects loading
-        train_loader, test_loader = load_nr_objects(args)
+        _, train_loader, test_loader = load_nr_objects(args)
+    elif args.dataset.lower() == "cmnist":
+        # here comes the nr-objects loading
+        _, train_loader, test_loader = load_cmnist(args)
     elif args.dataset.lower() == "stickfigures":
         train_loader, test_loader = load_stickfigures(args)
     else:

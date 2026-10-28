@@ -193,23 +193,26 @@ def load_cmnist(args):
 
     # Compute statistics without normalization or random augmentations.
 
-
-    stats_loader = DataLoader(
-        stats_dataset,
-        batch_size=stats_bs,
-        shuffle=False,
-        num_workers=0,
-        drop_last=False,
-        pin_memory=(device.type == "cuda"),
-    )
-
-    mean, std = channel_stats(stats_loader, device)
-    stats = [mean, std]
-
-
-    # This is a good important discovery !!!
-    mean = torch.as_tensor(stats[0]).detach().cpu().reshape(-1).tolist()
-    std = torch.as_tensor(stats[1]).detach().cpu().reshape(-1).tolist()
+    # --- Remove calculating the mean and std by himself ##########
+    # stats_loader = DataLoader(
+    #     stats_dataset,
+    #     batch_size=stats_bs,
+    #     shuffle=False,
+    #     num_workers=0,
+    #     drop_last=False,
+    #     pin_memory=(device.type == "cuda"),
+    # )
+    #
+    # mean, std = channel_stats(stats_loader, device)
+    # stats = [mean, std]
+    #
+    #
+    # # This is a good important discovery !!!
+    # mean = torch.as_tensor(stats[0]).detach().cpu().reshape(-1).tolist()
+    # std = torch.as_tensor(stats[1]).detach().cpu().reshape(-1).tolist()
+    ############################
+    std = (0.2274,)
+    mean = (0.0653,)
 
     tfms = [
         transforms.RandomApply(
@@ -247,13 +250,16 @@ def load_cmnist(args):
         transform=transform,
     )
 
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 
-    # for train datasets:
-    std = (0.2274,)
-    mean = (0.0653,)
+    # # for train datasets:
+    # std = (0.2274,)
+    # mean = (0.0653,)
+    # now the training transform
+
     transform = transforms.Compose([
         transforms.Grayscale(num_output_channels=1),
         transforms.ToTensor(),
@@ -264,7 +270,7 @@ def load_cmnist(args):
         root=src_path,
         transform=transform,
     )
-    trainloader = torch.utils.data.DataLoader(trainset,
+    preprocessing_dataloader = torch.utils.data.DataLoader(trainset,
                                               batch_size=args.batch_size,
                                               shuffle=True,
                                               drop_last=False, num_workers=0,   pin_memory=(device.type == "cuda"))
@@ -272,10 +278,14 @@ def load_cmnist(args):
 
     classes = trainset.classes
     class_dict = {i: c_i for i, c_i in enumerate(classes)}
-    pt_data, pt_labels = get_pt_data(trainloader, class_dict=class_dict)
+    pt_data, pt_labels = get_pt_data(preprocessing_dataloader, class_dict=class_dict)
 
-    base_dataset = torch.utils.data.TensorDataset(*(pt_data, torch.from_numpy(pt_labels)))
-    train_dataset = TransformDataset(base_dataset ,transform)
+    base_dataset = torch.utils.data.TensorDataset(*(pt_data, pt_labels))
+    tensor_transform = transforms.Compose([
+        transforms.Grayscale(num_output_channels=1),
+        transforms.Normalize(mean=mean, std=std),
+    ])
+    train_dataset = TransformDataset(base_dataset ,tensor_transform)
 
     pretrainloader = torch.utils.data.DataLoader(pretrain_dataset,
                                                  batch_size=args.batch_size,
@@ -302,15 +312,22 @@ def load_cmnist(args):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset", type=str, required=True)
-    parser.add_argument("--dataset-path", type=Path, required=True)
+    parser.add_argument("--dataset", type=str, default="cmnist")
+    parser.add_argument("--dataset-path", type=Path, default=r"C:\Users\erikc\Documents\Data\enrc_data\enrc_data\tmp_cmnist")
     parser.add_argument("--image-mode", type=str, default="RGB")
     parser.add_argument("--batch-size", type=int, default=128)
     return parser.parse_args()
 
 if __name__ == "__main__":
     args = parse_args()
-    prtrain_loader, trainloader, testloader = load_cmnist(args)
+    pretrain_loader, trainloader, testloader = load_cmnist(args)
 
     for data, label in trainloader:
+        print(f"data: {data}, label: {label}")
+
+
+    for data, label in pretrain_loader:
+        print(f"data: {data}, label: {label}")
+
+    for data, label in testloader:
         print(f"data: {data}, label: {label}")
