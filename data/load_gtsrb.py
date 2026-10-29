@@ -282,6 +282,9 @@ def load_gtsrb(args):
         transform=transform,
         is_valid_file=lambda path: path.lower().endswith(".png"),
     )
+    # for debugging
+    from collections import Counter
+    print("Label counts:", Counter(trainset.targets))
 
     helperloader = DataLoader(
         trainset,
@@ -330,7 +333,7 @@ def load_gtsrb(args):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=str, default="gtsrb")
-    parser.add_argument("--dataset-path", type=Path, default=r"C:\Users\erikc\Documents\Data\enrc_data\enrc_data\gtsrb\tmp")
+    parser.add_argument("--dataset-path", type=Path, default=r"C:\Users\erikc\Documents\Data\enrc_data\enrc_data\gtsrb\tmp\train")
     parser.add_argument("--image-mode", type=str, default="RGB")
     parser.add_argument("--batch-size", type=int, default=128)
     return parser.parse_args()
@@ -374,25 +377,25 @@ if __name__ == "__main__":
 
     for data, label in pretrain_loader:
         print(f"data: {data}, label: {label}")
-        idx = rng.randrange(len(data))
-        augmented_img = _gtsrb_type_aug(data[idx], 0.5)
-        img = data[idx].detach().cpu().permute(1, 2, 0).numpy()
-        img = img * std + mean
-          # Assumes original pixels were in [0, 1]
-
-
-        fig = go.Figure(go.Image(z=(img.clip(0, 1) * 255).astype("uint8")))
-        fig.update_yaxes(autorange="reversed", scaleanchor="x")
-        fig.show()
-
-        img = augmented_img.detach().cpu().permute(1, 2, 0).numpy()
-        img = img * std + mean
-          # Assumes original pixels were in [0, 1]
-
-
-        fig = go.Figure(go.Image(z=(img.clip(0, 1) * 255).astype("uint8")))
-        fig.update_yaxes(autorange="reversed", scaleanchor="x")
-        fig.show()
+        # idx = rng.randrange(len(data))
+        # augmented_img = _gtsrb_type_aug(data[idx], 0.5)
+        # img = data[idx].detach().cpu().permute(1, 2, 0).numpy()
+        # img = img * std + mean
+        #   # Assumes original pixels were in [0, 1]
+        #
+        #
+        # fig = go.Figure(go.Image(z=(img.clip(0, 1) * 255).astype("uint8")))
+        # fig.update_yaxes(autorange="reversed", scaleanchor="x")
+        # fig.show()
+        #
+        # img = augmented_img.detach().cpu().permute(1, 2, 0).numpy()
+        # img = img * std + mean
+        #   # Assumes original pixels were in [0, 1]
+        #
+        #
+        # fig = go.Figure(go.Image(z=(img.clip(0, 1) * 255).astype("uint8")))
+        # fig.update_yaxes(autorange="reversed", scaleanchor="x")
+        # fig.show()
 
     for data, label in trainloader:
         print(f"data: {data}, label: {label}")

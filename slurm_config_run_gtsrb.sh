@@ -32,5 +32,5 @@ python3 ./generic_self_expressive_multiview_clustering_senet_style.py --clusters
 --augmentation-roles=traffic_sign_type,traffic_sign_color  \
 --experiment-name=first_run \
 --loss-weights-config=configs/gtsrb.yaml \
---dataset-path=data/datasets/enrc_data/gtsrb >> ./outputs/deep_imc_gtsrb_single_out.txt
+--dataset-path=data/datasets/enrc_data/gtsrb/train >> ./outputs/deep_imc_gtsrb_single_out.txt
 
