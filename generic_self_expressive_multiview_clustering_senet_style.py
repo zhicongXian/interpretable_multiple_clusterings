@@ -53,7 +53,9 @@ from loss.utils import (beta_effective_dimension_loss, beta_mass_balance_loss,
 from data.load_nr_objects import load_nr_objects
 from data.load_cmnist import load_cmnist
 from data.load_stickfigures import load_stickfigures
+from data.load_gtsrb import load_gtsrb
 from utils.general_utils import set_seed
+from torchvision import transforms as T
 
 def _integer_tuple(text: str) -> tuple[int, ...]:
     values = tuple(int(value.strip()) for value in text.split(",") if value.strip())
@@ -680,13 +682,26 @@ def _maximize_latent_diversity(values: Tensor, eps = 1.0) -> Tensor:
 def _pairwise_hsic_projected_view(values: Sequence[Tensor], eps = 1.0 ) -> Tensor:
     if len(values) < 2:
         return values[0].new_zeros(())
-    total_coding_rate = TotalCodingRate(eps=eps)
+    # total_coding_rate = TotalCodingRate(eps=eps)
     return torch.stack(
         [
-            soft_nmi(left, right) # total_coding_rate(left, right)
+            _pairwise_affinity_hsic_loss(left, right)# soft_nmi(left, right) # total_coding_rate(left, right)
             for left, right in itertools.combinations(values, 2)
         ]
     ).mean()
+
+def _pairwise_affinity_hsic_loss(
+    A_s: torch.Tensor,
+    A_sp: torch.Tensor,
+    eps: float = 1e-10,
+) -> torch.Tensor:
+    """Normalized Frobenius inner product of two affinity matrices."""
+    numerator = torch.trace(A_sp.T @ A_s) # torch.sum(A_sp * A_s)  # Equivalent to Tr(A_sp.T @ A_s)
+    denominator = (
+    (torch.linalg.matrix_norm(A_sp, ord="fro") + eps)
+        * (torch.linalg.matrix_norm(A_s, ord="fro") + eps)
+    )
+    return numerator / denominator
 
 def _pairwise_cluster_diversity(values: Sequence[Tensor], eps = 1.0 ) -> Tensor:
     if len(values) < 2:
@@ -1262,6 +1277,33 @@ def _mask_vertical_region(
     masked = images * keep_mask
     return (1.0 - strength) * images + strength * masked
 
+def _gtsrb_type_aug(
+    images: Tensor,  strength: float )-> Tensor:
+    type_aug = T.Compose([
+        T.Grayscale(num_output_channels=3),
+        T.RandomAffine(
+            degrees=5,
+            translate=(0.03, 0.03),
+            scale=(0.95, 1.05),
+        ),
+        T.ColorJitter(brightness=0.15, contrast=0.15),
+    ])
+    aug_img = type_aug(images)
+
+    return (1.0 - strength) * images + strength * aug_img
+
+def _gtsrb_color_aug(x:Tensor, strength) -> Tensor:
+    if len(x.shape) ==4:
+        b, c, h, w = x.shape
+    elif len(x.shape) ==3:
+        c, h, w = x.shape
+    else:
+        raise ValueError("Unexpected input shape: {}".format(x.shape))
+    permutation = torch.randperm(h * w, device=x.device)
+    aug_img =  x.reshape(c, -1)[:, permutation].reshape(c, h, w)
+
+    return (1.0 - strength) * x + strength * aug_img
+
 def _mask_horizontal_region(
     images: Tensor,
     region: str,
@@ -1311,6 +1353,7 @@ def augment_for_view(
     upper_lower_mask_strength: float = 1.0,
     left_right_mask_split: float = 0.5,
     left_right_mask_strength: float = 1.0,
+        traffic_sign_color_type_strength: float = 1.0,
 ) -> Tensor:
     """Create an augmentation that removes nuisance information for one view.
 
@@ -1381,7 +1424,13 @@ def augment_for_view(
             split_fraction=left_right_mask_split,
             strength=left_right_mask_strength,
         )
-
+    elif role == "traffic_sign_color":
+        augmented = images
+        augmented = _gtsrb_color_aug(augmented, strength = traffic_sign_color_type_strength)
+    elif role == "traffic_sign_type":
+        augmented = images
+        augmented = _gtsrb_type_aug(augmented, strength=traffic_sign_color_type_strength)
+        # facets = ["traffic_sign_color", "traffic_sign_type"]
     elif role == "generic":
         augmented = images
     else:
@@ -2002,6 +2051,9 @@ def evaluate_clustering(
         facets=["upper", "lower"]
     elif args.dataset.lower() == "cmnist":
         facets=["left", "right"]
+    elif args.dataset.lower() == "gtsrb":
+        facets=["traffic_sign_color", "traffic_sign_type"]
+
 
     predictions=np.asarray(predictions)
     labels=np.asarray(labels)
@@ -2487,7 +2539,9 @@ def run(args: argparse.Namespace) -> None:
         args.augmentation_roles = tuple(
             role.lower() for role in args.augmentation_roles
         )
-        allowed_roles = {"color", "shape", "material", "upper", "lower", "generic","left", "right"}
+        allowed_roles = {"color", "shape", "material", "upper", "lower", "generic","left", "right",
+                         "traffic_sign_color", "traffic_sign_type"
+}
         unknown_roles = sorted(set(args.augmentation_roles) - allowed_roles)
         if unknown_roles:
             raise ValueError(
@@ -2505,6 +2559,17 @@ def run(args: argparse.Namespace) -> None:
             role_by_cluster_count[cluster_count]
             for cluster_count in args.clusters
         )
+    if (
+            args.dataset.lower() == "gtsrb"
+            and args.augmentation_roles is None
+            and sorted(args.clusters) == [2,4]
+    ):
+        # Standard NR-Objects: 6 colors, 3 shapes, and 2 materials. Preserve
+        # the user's cluster order when selecting semantic augmentations.
+        role_by_cluster_count = {6: "color", 3: "shape", 2: "material"}
+        args.augmentation_roles =  ["traffic_sign_color", "traffic_sign_type"]
+
+
     if args.dataset.lower() == "stickfigures" and args.augmentation_roles is None:
         if len(args.clusters) != 2:
             raise ValueError(
@@ -2532,6 +2597,9 @@ def run(args: argparse.Namespace) -> None:
     elif args.dataset.lower() == "nr_objects":
         # here comes the nr-objects loading
         pretrain_dataloader,  train_loader, test_loader = load_nr_objects(args)
+    elif args.dataset.lower() == "gtsrb":
+        # here comes the nr-objects loading
+        pretrain_dataloader,  train_loader, test_loader = load_gtsrb(args)
     elif args.dataset.lower() == "cmnist":
         # here comes the nr-objects loading
         pretrain_dataloader, train_loader, test_loader = load_cmnist(args)
@@ -2744,6 +2812,9 @@ def inference(args: argparse.Namespace):
     elif args.dataset.lower() == "cmnist":
         # here comes the nr-objects loading
         _, train_loader, test_loader = load_cmnist(args)
+    elif args.dataset.lower() == "gtsrb":
+        # here comes the nr-objects loading
+        _, train_loader, test_loader = load_gtsrb(args)
     elif args.dataset.lower() == "stickfigures":
         train_loader, test_loader = load_stickfigures(args)
     else:

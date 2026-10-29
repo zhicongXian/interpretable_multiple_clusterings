@@ -266,7 +266,7 @@ def load_nr_objects(args,CONCAT_LABELS = True):
     pretrain_dataloader = torch.utils.data.DataLoader(TransformDataset(base_dataset, pretrain_transform),
                                               batch_size=args.batch_size,
                                               shuffle=True,
-                                              drop_last=True, num_workers=0, pin_memory=True)
+                                              drop_last=False, num_workers=0, pin_memory=True)
 
     return pretrain_dataloader, trainloader, testloader
 

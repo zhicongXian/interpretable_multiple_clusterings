@@ -14,6 +14,10 @@ from collections import OrderedDict
 from torchvision import datasets
 import torchvision.transforms as transforms
 import argparse
+import random
+import plotly.graph_objects as go
+from torchvision import transforms as T
+from torch import Tensor
 
 """
 Code adapted from https://github.com/mesnico/RelationNetworks-CLEVR/edit/master/clevr_dataset_connector.py
@@ -167,7 +171,7 @@ def load_gtsrb(args):
 
     src_path = args.dataset_path #"C:\\Users\\zhicong\\Documents\\Data\\enrc_data\\enrc_data\\nr_objects"
     # args.dataset_path = clevr_dir
-    image_mode = args.image_mode
+    image_mode = "RGB"
     use_gpu = True
     bs = 64
     stats_bs = 64
@@ -221,9 +225,10 @@ def load_gtsrb(args):
         pin_memory=(device.type == "cuda"),
     )
 
-    mean, std = channel_stats(stats_loader, device)
-    stats = [mean, std]
-
+    # mean, std = channel_stats(stats_loader, device)
+    # stats = [mean, std]
+    std = (0.2920, 0.2910, 0.2926)
+    mean = (0.5130, 0.5133, 0.5137)
 
     # This is a good important discovery !!!
     augmentations = [
@@ -260,16 +265,16 @@ def load_gtsrb(args):
         files,
         image_transform=transforms.Compose(train_transforms),
         normalize=transforms.Normalize(
-            mean=mean.tolist(),
-            std=std.tolist(),
+            mean=mean,
+            std=std,
         ),
-        image_mode=image_mode,
+        image_mode="RGB",
     )
 
     # for train datasets:
     transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize(mean=mean.tolist(), std=std.tolist()),
+        transforms.Normalize(mean=mean, std=std),
     ])
 
     trainset = datasets.ImageFolder(
@@ -297,7 +302,7 @@ def load_gtsrb(args):
     # )
     pt_data, pt_labels = get_pt_data(helperloader)
     base_dataset = torch.utils.data.TensorDataset(*(pt_data, torch.from_numpy(pt_labels)))
-    train_dataset = TransformDataset(base_dataset,transform)
+
 
     pretrainloader = torch.utils.data.DataLoader(pretrain_dataset,
                                              batch_size=args.batch_size,
@@ -306,7 +311,7 @@ def load_gtsrb(args):
                                              pin_memory=(device.type == "cuda"),
                                              num_workers=0)
 
-    testloader = torch.utils.data.DataLoader(train_dataset,
+    testloader = torch.utils.data.DataLoader(base_dataset,
                                              batch_size=args.batch_size,
                                              shuffle=False,
                                              drop_last=False,
@@ -315,7 +320,7 @@ def load_gtsrb(args):
 
 
 
-    trainloader = torch.utils.data.DataLoader(train_dataset,
+    trainloader = torch.utils.data.DataLoader(base_dataset,
                                               batch_size=args.batch_size,
                                               shuffle=True,
                                               drop_last=False, num_workers=0,   pin_memory=(device.type == "cuda"))
@@ -324,15 +329,74 @@ def load_gtsrb(args):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset", type=str, required=True)
-    parser.add_argument("--dataset-path", type=Path, required=True)
+    parser.add_argument("--dataset", type=str, default="gtsrb")
+    parser.add_argument("--dataset-path", type=Path, default=r"C:\Users\erikc\Documents\Data\enrc_data\enrc_data\gtsrb\tmp")
     parser.add_argument("--image-mode", type=str, default="RGB")
     parser.add_argument("--batch-size", type=int, default=128)
     return parser.parse_args()
 
+
+def _gtsrb_type_aug(
+    images: Tensor,  strength: float )-> Tensor:
+    type_aug = T.Compose([
+        T.Grayscale(num_output_channels=3),
+        T.RandomAffine(
+            degrees=5,
+            translate=(0.03, 0.03),
+            scale=(0.95, 1.05),
+        ),
+        T.ColorJitter(brightness=0.15, contrast=0.15),
+    ])
+    aug_img = type_aug(images)
+
+    return (1.0 - strength) * images + strength * aug_img
+
+def _gtsrb_color_aug(x:Tensor, strength) -> Tensor:
+    if len(x.shape) == 4:
+        b, c, h, w = x.shape
+    elif len(x.shape) == 3:
+        c, h, w = x.shape
+    else:
+        raise ValueError("Unexpected input shape: {}".format(x.shape))
+    permutation = torch.randperm(h * w, device=x.device)
+    aug_img =  x.reshape(c, -1)[:, permutation].reshape(c, h, w)
+
+    return (1.0 - strength) * x + strength * aug_img
+
+
 if __name__ == "__main__":
     args = parse_args()
     pretrain_loader, trainloader, testloader = load_gtsrb(args)
+    rng = random.Random(42)  # Set seed
+      # 0 <= idx < len(t)
+    std = (0.2920, 0.2910, 0.2926)
+    mean = (0.5130, 0.5133, 0.5137)
+
+    for data, label in pretrain_loader:
+        print(f"data: {data}, label: {label}")
+        idx = rng.randrange(len(data))
+        augmented_img = _gtsrb_type_aug(data[idx], 0.5)
+        img = data[idx].detach().cpu().permute(1, 2, 0).numpy()
+        img = img * std + mean
+          # Assumes original pixels were in [0, 1]
+
+
+        fig = go.Figure(go.Image(z=(img.clip(0, 1) * 255).astype("uint8")))
+        fig.update_yaxes(autorange="reversed", scaleanchor="x")
+        fig.show()
+
+        img = augmented_img.detach().cpu().permute(1, 2, 0).numpy()
+        img = img * std + mean
+          # Assumes original pixels were in [0, 1]
+
+
+        fig = go.Figure(go.Image(z=(img.clip(0, 1) * 255).astype("uint8")))
+        fig.update_yaxes(autorange="reversed", scaleanchor="x")
+        fig.show()
 
     for data, label in trainloader:
+        print(f"data: {data}, label: {label}")
+
+
+    for data, label in testloader:
         print(f"data: {data}, label: {label}")
