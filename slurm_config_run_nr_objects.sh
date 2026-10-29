@@ -5,7 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --time=10-00:00:00
 #SBATCH --gres=gpu:1
-#SBATCH --mem=512G
+#SBATCH --mem=256G
 
 # debug info
 hostname
