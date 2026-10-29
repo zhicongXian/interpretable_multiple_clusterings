@@ -28,7 +28,7 @@ python3 ./generic_self_expressive_multiview_clustering_senet_style_wandb.py --cl
 --visualization=./outputs/nr_objects_sweep.html \
 --dataset=nr_objects \
 --tensorboard-log-dir=./outputs/runs_nr_objects_sweep \
---augmentation-roles=color,shape,material  \
+--augmentation-roles=color,material,shape  \
 --experiment-name=with_augmentation_sweep \
 --loss-weights-config=configs/nr_objects.yaml \
 --wandb-sweep \

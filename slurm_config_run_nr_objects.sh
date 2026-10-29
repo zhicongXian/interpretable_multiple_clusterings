@@ -5,7 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --time=10-00:00:00
 #SBATCH --gres=gpu:1
-#SBATCH --mem=256G
+#SBATCH --mem=512G
 
 # debug info
 hostname
@@ -29,7 +29,7 @@ python3 ./generic_self_expressive_multiview_clustering_senet_style.py --clusters
 --visualization=./outputs/nr_objects_v3.html \
 --dataset=nr_objects \
 --tensorboard-log-dir=./outputs/runs_nr_objects \
---augmentation-roles=color,shape,material  \
+--augmentation-roles=color,material,shape   \
 --experiment-name=with_augmentation_larger_weights \
 --loss-weights-config=configs/nr_objects.yaml \
 --dataset-path=data/datasets/enrc_data/nr_objects >> ./outputs/deep_imc_nr_objects_single_out.txt
