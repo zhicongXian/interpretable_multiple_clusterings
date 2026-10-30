@@ -3,7 +3,7 @@ loss_weights:
     self_expression: 0.5
     coefficient_regularization: 0.02
     stability: 0.05
-    augmentation_consistency: 2.0 #0.2 # 0.1#0.05
+    augmentation_consistency: 0.5 # 1.0 --Seem too much #0.2 # 0.1#0.05
     independence:  0.2 #0.02 # 0.02
     projection_orthogonality:  0.001 #0.01
     projection_overlap:  0.005 # 0.05
@@ -13,7 +13,7 @@ loss_weights:
     latent_variance: 0.05
     worst_view_temperature:  0.1
     embedding_diversity:  0.0 # 0.00002
-    normalized_cut:  1.0 # 0.1
+    normalized_cut: 0.5 # 0.1 --seem too small # 0.1
     cluster_assignment_orthogonality:  0.05
-    cluster_diversity: 0.2
+    cluster_diversity: 0.0
     affinity_diversity: 0.2
