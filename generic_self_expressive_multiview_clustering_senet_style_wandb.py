@@ -678,13 +678,26 @@ def _maximize_latent_diversity(values: Tensor, eps = 1.0) -> Tensor:
     total_coding_rate = TotalCodingRate(eps=eps)
     return total_coding_rate(values, values)
 
+def _pairwise_affinity_hsic_loss(
+    A_s: torch.Tensor,
+    A_sp: torch.Tensor,
+    eps: float = 1e-10,
+) -> torch.Tensor:
+    """Normalized Frobenius inner product of two affinity matrices."""
+    numerator = torch.trace(A_sp.T @ A_s) # torch.sum(A_sp * A_s)  # Equivalent to Tr(A_sp.T @ A_s)
+    denominator = (
+    (torch.linalg.matrix_norm(A_sp, ord="fro") + eps)
+        * (torch.linalg.matrix_norm(A_s, ord="fro") + eps)
+    )
+    return numerator / denominator
+
 def _pairwise_hsic_projected_view(values: Sequence[Tensor], eps = 1.0 ) -> Tensor:
     if len(values) < 2:
         return values[0].new_zeros(())
-    total_coding_rate = TotalCodingRate(eps=eps)
+    # total_coding_rate = TotalCodingRate(eps=eps)
     return torch.stack(
         [
-            soft_nmi(left, right) # total_coding_rate(left, right)
+            _pairwise_affinity_hsic_loss(left, right)# soft_nmi(left, right) # total_coding_rate(left, right)
             for left, right in itertools.combinations(values, 2)
         ]
     ).mean()
@@ -759,76 +772,76 @@ def soft_nmi(
     return nmi# , mi, entropy_i, entropy_j
 
 
-def multiview_loss(
-    images: Tensor,
-    outputs: dict[str, Any],
-    *,
-    weights: LossWeights,
-    minimum_effective_dimensions: float,
-    augmented: tuple[dict[str, Any], dict[str, Any]] | None = None,
-) -> tuple[Tensor, dict[str, Tensor]]:
-    self_expression = smooth_worst_view(
-        [
-            F.mse_loss(item["reconstructed_latent"], latent)
-            for item, latent in zip(
-                outputs["self_expression"], outputs["projected_views"]
-            )
-        ],
-        weights.worst_view_temperature,
-    )
-    coefficient_regularization = smooth_worst_view(
-        [item["elastic_net"] for item in outputs["self_expression"]],
-        weights.worst_view_temperature,
-    )
-    stability = (
-        smooth_worst_view(
-            [
-                F.mse_loss(left, right)
-                for left, right in zip(
-                    augmented[0]["coefficients"], augmented[1]["coefficients"]
-                )
-            ],
-            weights.worst_view_temperature,
-        )
-        if augmented is not None
-        else images.new_zeros(())
-    )
-    latent_variance = smooth_worst_view(
-        [
-            F.relu(
-                0.5 - latent.var(dim=0, unbiased=False).add(1e-4).sqrt() ##--TODO: is this necessary? latent_var <= 0.5
-            ).mean()
-            for latent in outputs["projected_views"]
-        ],
-        weights.worst_view_temperature,
-    )
-    # independence = 0.5 * (
-    #     _pairwise_hsic(outputs["projected_views"])
-    #     + _pairwise_hsic(outputs["affinities"])#_pairwise_hsic(outputs["affinities"])
-    # )
-    independence = _pairwise_hsic(outputs["projected_views"])
-    cluster_diversity = _pairwise_hsic_projected_view(outputs["affinities"])
-    maximize_latent_diversity = _maximize_latent_diversity(outputs["shared"])
-    terms = {
-        "reconstruction": F.mse_loss(outputs["reconstruction"], images),
-        "self_expression": self_expression,
-        "coefficient_regularization": coefficient_regularization,
-        "stability": stability,
-        "independence": independence,
-        "projection_overlap": semi_orthogonal_overlap_loss(
-            outputs["projection_weights"]
-        ),
-        "beta_entropy": beta_entropy(outputs["beta"]),
-        "beta_mass_balance": beta_mass_balance_loss(outputs["beta"]),
-        "beta_effective_dimension": beta_effective_dimension_loss(
-            outputs["beta"], minimum_effective_dimensions
-        ),
-        "latent_variance": latent_variance,
-        "embedding_diversity":  maximize_latent_diversity,
-        "cluster_diversity": cluster_diversity
-    }
-    total = sum(getattr(weights, name) * value for name, value in terms.items())
-    return total, terms
+# def multiview_loss(
+#     images: Tensor,
+#     outputs: dict[str, Any],
+#     *,
+#     weights: LossWeights,
+#     minimum_effective_dimensions: float,
+#     augmented: tuple[dict[str, Any], dict[str, Any]] | None = None,
+# ) -> tuple[Tensor, dict[str, Tensor]]:
+#     self_expression = smooth_worst_view(
+#         [
+#             F.mse_loss(item["reconstructed_latent"], latent)
+#             for item, latent in zip(
+#                 outputs["self_expression"], outputs["projected_views"]
+#             )
+#         ],
+#         weights.worst_view_temperature,
+#     )
+#     coefficient_regularization = smooth_worst_view(
+#         [item["elastic_net"] for item in outputs["self_expression"]],
+#         weights.worst_view_temperature,
+#     )
+#     stability = (
+#         smooth_worst_view(
+#             [
+#                 F.mse_loss(left, right)
+#                 for left, right in zip(
+#                     augmented[0]["coefficients"], augmented[1]["coefficients"]
+#                 )
+#             ],
+#             weights.worst_view_temperature,
+#         )
+#         if augmented is not None
+#         else images.new_zeros(())
+#     )
+#     latent_variance = smooth_worst_view(
+#         [
+#             F.relu(
+#                 0.5 - latent.var(dim=0, unbiased=False).add(1e-4).sqrt() ##--TODO: is this necessary? latent_var <= 0.5
+#             ).mean()
+#             for latent in outputs["projected_views"]
+#         ],
+#         weights.worst_view_temperature,
+#     )
+#     # independence = 0.5 * (
+#     #     _pairwise_hsic(outputs["projected_views"])
+#     #     + _pairwise_hsic(outputs["affinities"])#_pairwise_hsic(outputs["affinities"])
+#     # )
+#     independence = _pairwise_hsic(outputs["projected_views"])
+#     cluster_diversity = _pairwise_hsic_projected_view(outputs["affinities"])
+#     maximize_latent_diversity = _maximize_latent_diversity(outputs["shared"])
+#     terms = {
+#         "reconstruction": F.mse_loss(outputs["reconstruction"], images),
+#         "self_expression": self_expression,
+#         "coefficient_regularization": coefficient_regularization,
+#         "stability": stability,
+#         "independence": independence,
+#         "projection_overlap": semi_orthogonal_overlap_loss(
+#             outputs["projection_weights"]
+#         ),
+#         "beta_entropy": beta_entropy(outputs["beta"]),
+#         "beta_mass_balance": beta_mass_balance_loss(outputs["beta"]),
+#         "beta_effective_dimension": beta_effective_dimension_loss(
+#             outputs["beta"], minimum_effective_dimensions
+#         ),
+#         "latent_variance": latent_variance,
+#         "embedding_diversity":  maximize_latent_diversity,
+#         "cluster_diversity": cluster_diversity
+#     }
+#     total = sum(getattr(weights, name) * value for name, value in terms.items())
+#     return total, terms
 
 
 def _make_writer(path: Path | None) -> Any | None:
@@ -1216,6 +1229,17 @@ def _material_relighting_augmentation(
     relit = images * diffuse + amplitude * reflection * object_mask
     return relit.clamp(0.0, 1.0)
 
+def _pairwise_cluster_diversity(values: Sequence[Tensor], eps = 1.0 ) -> Tensor:
+    if len(values) < 2:
+        return values[0].new_zeros(())
+
+    return torch.stack(
+        [
+            soft_nmi(left, right, from_logits=False) # total_coding_rate(left, right)
+            for left, right in itertools.combinations(values, 2)
+        ]
+    ).mean()
+
 
 def _mask_vertical_region(
     images: Tensor,
@@ -1583,7 +1607,8 @@ def multiview_loss_with_augmentation(
     #     + _pairwise_hsic(outputs["affinities"])
     # )
     independence = _pairwise_hsic(outputs["projected_views"])
-    cluster_diversity = _pairwise_hsic_projected_view(outputs["affinities"])
+    cluster_diversity = _pairwise_cluster_diversity(outputs["soft_assignments"])
+    affinity_diversity = _pairwise_hsic_projected_view(outputs["affinities"])
     maximize_latent_diversity = _maximize_latent_diversity(outputs["shared"])
     normalized_cut, cluster_assignment_orthogonality = (
         differentiable_normalized_cut_losses(
@@ -1615,7 +1640,8 @@ def multiview_loss_with_augmentation(
         ),
         "latent_variance": latent_variance,
         "embedding_diversity": maximize_latent_diversity,
-        "cluster_diversity": cluster_diversity
+        "cluster_diversity": cluster_diversity,
+        "affinity_diversity": affinity_diversity,
     }
     total = sum(getattr(weights, name) * value for name, value in terms.items())
     return total, terms

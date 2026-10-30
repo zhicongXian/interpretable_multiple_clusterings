@@ -1429,7 +1429,7 @@ def augment_for_view(
         augmented = _gtsrb_color_aug(augmented, strength = traffic_sign_color_type_strength)
     elif role == "traffic_sign_type":
         augmented = images
-        augmented = _gtsrb_type_aug(augmented, strength=traffic_sign_color_type_strength)
+        augmented = _gtsrb_type_aug(augmented, strength=1.0)
         # facets = ["traffic_sign_color", "traffic_sign_type"]
     elif role == "generic":
         augmented = images
