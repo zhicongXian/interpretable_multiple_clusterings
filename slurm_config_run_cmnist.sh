@@ -24,7 +24,7 @@ python3 ./generic_self_expressive_multiview_clustering_senet_style.py --clusters
 --pretrain-epochs=1000 \
 --joint-epochs=2000 \
 --view-epochs=3000 \
---batch-size=512 \
+--batch-size=64 \
 --checkpoint=./outputs/cmnist.pt \
 --visualization=./outputs/cmnist.html \
 --dataset=cmnist \
