@@ -1,0 +1,19 @@
+loss_weights:
+    reconstruction: 1.0
+    self_expression: 0.2
+    coefficient_regularization: 0.02
+    stability:  0.05
+    augmentation_consistency: 200
+    independence: 0.0
+    projection_orthogonality: 0.001
+    projection_overlap: float = 0.005
+    beta_entropy: float = 0.01
+    beta_mass_balance: float = 0.2
+    beta_effective_dimension: float = 0.0
+    latent_variance: float = 0.05
+    worst_view_temperature: float = 0.1
+    embedding_diversity: float = 0.0
+    normalized_cut: float = 0.1
+    cluster_assignment_orthogonality: 0.05
+    cluster_diversity: 0.1
+    affinity_diversity: 0.1
