@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
 #SBATCH --job-name=deep_imc_nr_objects_sensitivity_study
+#SBATCH --array=0-35
 #SBATCH --output=./outputs/deep_imc_nr_objects_sensitivity_%A_%a.out
 #SBATCH --time=10-00:00:00
 #SBATCH --gres=gpu:1
