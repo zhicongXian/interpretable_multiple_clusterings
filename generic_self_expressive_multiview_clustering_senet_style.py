@@ -1767,7 +1767,7 @@ def train_phase(
     optimizer = torch.optim.AdamW(parameters, lr=learning_rate, weight_decay=1e-4)
     history: list[dict[str, float]] = []
 
-    early_stopper = EarlyStopper(patience=200, min_delta=0.005, decimals=10)
+    early_stopper = EarlyStopper(patience=200, min_delta=0.01, decimals=6) # decimal=10, min_delta=0.005
     for epoch in range(1, epochs + 1):
         model.train()
         sums: dict[str, float] = {"total": 0.0}
