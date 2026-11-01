@@ -1999,6 +1999,8 @@ def evaluate_clustering(
     *,
     n_neighbors: int,
     random_state: int,
+    phase: str,
+    weights: LossWeights
 ) -> dict[str, Any]:
     from scipy.optimize import linear_sum_assignment
     from sklearn.cluster import SpectralClustering
@@ -2100,6 +2102,7 @@ def evaluate_clustering(
                     f"{value:>{column_width}.4f}" for value in matrix[view]
                 )
             )
+
     print("\nOptimal one-to-one correspondence (evaluation only):")
     for match in matches:
         print(
@@ -2117,6 +2120,8 @@ def evaluate_clustering(
     output_file = f"./outputs/{args.dataset}_{args.experiment_name}_clustering_results.txt"
 
     with open(output_file, "a+", encoding="utf-8") as file:
+        print(f"\n Current phase: {phase}", file=file)
+        print(f"\n Loss weights: {weights}", file=file)
         print("\nOptimal one-to-one correspondence (evaluation only):", file=file)
 
         for match in matches:
@@ -2343,6 +2348,17 @@ def parse_args() -> argparse.Namespace:
         required=False,
     )
 
+    parser.add_argument(
+        "--self-expressive-weight",
+        type=float,
+        default=None,
+        help=(
+            "Optional CLI override for the self-expressive term loss weight. "
+            "weight. Overrides --loss-weights-config."
+        ),
+        required=False,
+    )
+
     parser.add_argument("--spectral-neighbors", type=int, default=20)
     parser.add_argument("--minimum-effective-dimensions", type=float, default=None)
     parser.add_argument("--pretrain-epochs", type=int, default=200)
@@ -2496,6 +2512,7 @@ def run(args: argparse.Namespace) -> None:
         "reconstruction": args.reconstruction_weight,
         "cluster_diversity": args.cluster_diversity_weight,
         "affinity_diversity": args.affinity_diversity_weight,
+        "self_expression":args.self_expressive_weight,
     }
     weights = replace(
         weights,
@@ -2686,6 +2703,8 @@ def run(args: argparse.Namespace) -> None:
             dataset = args.dataset,
             n_neighbors=args.spectral_neighbors,
             random_state=args.seed,
+            phase = "pretrain",
+            weights = weights
         )
         view_history, optimizer = train_phase(
             model,
@@ -2718,6 +2737,8 @@ def run(args: argparse.Namespace) -> None:
             dataset = args.dataset,
             n_neighbors=args.spectral_neighbors,
             random_state=args.seed,
+            phase = "view",
+            weights = weights,
         )
         joint_history, optimizer = train_phase(
             model,
@@ -2749,6 +2770,8 @@ def run(args: argparse.Namespace) -> None:
             dataset = args.dataset,
             n_neighbors=args.spectral_neighbors,
             random_state=args.seed,
+            phase="joint",
+            weights=weights,
         )
         test_images, _ = next(iter(test_loader))
         if args.sample_index is not None:
@@ -2855,6 +2878,8 @@ def inference(args: argparse.Namespace):
         dataset=args.dataset,
         n_neighbors=args.spectral_neighbors,
         random_state=args.seed,
+        phase="inference",
+        weights= None,
         )
     test_images, _ = next(iter(test_loader))
 
