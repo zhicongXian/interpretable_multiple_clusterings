@@ -13,7 +13,9 @@ from collections import OrderedDict
 from torchvision import datasets
 import torchvision.transforms as transforms
 import argparse
-
+from torchvision import transforms as T
+from torch import Tensor
+import plotly.graph_objects as go
 """
 Code adapted from https://github.com/mesnico/RelationNetworks-CLEVR/edit/master/clevr_dataset_connector.py
 to parse the json files easily.
@@ -27,6 +29,7 @@ from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
+import random
 
 def get_pt_data(dl, class_dict):
     pt_data = []
@@ -161,7 +164,32 @@ class GrayscaleAutoencoderDataset(Dataset):
         return x, x.clone()             # Same image as target
 
 
+class MultiLabelImageFolder(Dataset):
+    """Load images on demand and return two labels per image."""
 
+    def __init__(self, image_folder):
+        self.image_folder = image_folder
+
+        # For example, folder "3_7" becomes tensor([3, 7]).
+        self.class_labels = torch.tensor(
+            [
+                [int(part) for part in name.split("_")[:2]]
+                for name in image_folder.classes
+            ],
+            dtype=torch.long,
+        )
+
+        if self.class_labels.shape != (len(image_folder.classes), 2):
+            raise ValueError(
+                "Expected folder names containing two labels, such as '3_7'."
+            )
+
+    def __len__(self):
+        return len(self.image_folder)
+
+    def __getitem__(self, index):
+        image, class_index = self.image_folder[index]
+        return image, self.class_labels[class_index]
 
 def load_cmnist(args):
 
@@ -269,20 +297,21 @@ def load_cmnist(args):
         root=src_path,
         transform=transform,
     )
-    preprocessing_dataloader = torch.utils.data.DataLoader(trainset,
-                                              batch_size=args.batch_size,
-                                              shuffle=True,
-                                              drop_last=False, num_workers=0,   pin_memory=(device.type == "cuda"))
+
+    # preprocessing_dataloader = torch.utils.data.DataLoader(trainset,
+    #                                           batch_size=args.batch_size,
+    #                                           shuffle=True,
+    #                                           drop_last=False, num_workers=0,   pin_memory=(device.type == "cuda"))
 
 
     classes = trainset.classes
     class_dict = {i: c_i for i, c_i in enumerate(classes)}
-    pt_data, pt_labels = get_pt_data(preprocessing_dataloader, class_dict=class_dict)
-
-    base_dataset = torch.utils.data.TensorDataset(*(pt_data, pt_labels))
+    # pt_data, pt_labels = get_pt_data(preprocessing_dataloader, class_dict=class_dict) # --TODO here is the source to crash!!!
+    base_dataset = MultiLabelImageFolder(trainset)
+    # base_dataset = torch.utils.data.TensorDataset(*(pt_data, pt_labels))
     tensor_transform = transforms.Compose([
         transforms.Grayscale(num_output_channels=1),
-        transforms.Normalize(mean=mean, std=std),
+        # transforms.Normalize(mean=mean, std=std),
     ])
     train_dataset = TransformDataset(base_dataset ,tensor_transform)
 
@@ -317,13 +346,91 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=128)
     return parser.parse_args()
 
+def _mask_horizontal_region(
+    images: Tensor,
+    region: str,
+    *,
+    split_fraction: float,
+    strength: float,
+) -> Tensor:
+    """Mask the upper or lower image region with the zero/background value.
+
+    ``split_fraction`` is the boundary measured from the top of the image.
+    ``strength=1`` completely removes the selected region, while smaller
+    values blend the original pixels with the masked image.
+    """
+
+    if region not in {"left", "right"}:
+        raise ValueError("region must be either 'left' or 'right'.")
+    if not 0.0 < split_fraction < 1.0:
+        raise ValueError("split_fraction must lie strictly between 0 and 1.")
+    if not 0.0 <= strength <= 1.0:
+        raise ValueError("mask strength must lie in [0, 1].")
+    if images.ndim != 4 or images.shape[-1] < 2:
+        raise ValueError("images must have shape [N, C, H, W] with W >= 2.")
+
+    width = images.shape[-1]
+    split_column = min(max(int(round(width * split_fraction)), 1), width - 1)
+    keep_mask = images.new_ones((1, 1, 1, width))
+    if region == "left":
+        keep_mask[..., :split_column] = 0.0
+    else:
+        keep_mask[..., split_column:] = 0.0
+    masked = images * keep_mask
+    return (1.0 - strength) * images + strength * masked
+
 if __name__ == "__main__":
     args = parse_args()
     pretrain_loader, trainloader, testloader = load_cmnist(args)
-
+    # here we would like to test the augmentation
+    rng = random.Random(42)  # Set seed
+    std = (0.2274,)
+    mean = (0.0653,)
+    verbose = True
     for data, label in trainloader:
         print(f"data: {data}, label: {label}")
+        if verbose:
+            idx = rng.randrange(len(data))
+            augmented_img = _mask_horizontal_region(data[idx][None,:], "left", split_fraction=0.5, strength= 1.0)
+            img = data[idx].detach().cpu().permute(1, 2, 0).numpy()
+            img = img * std + mean
+            img = img.squeeze()
+              # Assumes original pixels were in [0, 1]
 
+            fig = go.Figure(go.Heatmap(
+                z=img,
+                colorscale="Gray",
+                showscale=False,
+                zmin=0,  # For pixel values in [0, 1]
+                zmax=1,
+            ))
+
+            # Put the first row at the top and preserve square pixels.
+            fig.update_yaxes(autorange="reversed", scaleanchor="x", scaleratio=1)
+            fig.update_xaxes(visible=False)
+            fig.update_yaxes(visible=False)
+            fig.show()
+
+            img = augmented_img.squeeze(0).detach().cpu().permute(1, 2, 0).numpy()
+            img = img.squeeze()
+            img = img * std + mean
+            # Assumes original pixels were in [0, 1]
+
+            # Assumes original pixels were in [0, 1]
+
+            fig = go.Figure(go.Heatmap(
+                z=img,
+                colorscale="Gray",
+                showscale=False,
+                zmin=0,  # For pixel values in [0, 1]
+                zmax=1,
+            ))
+
+            # Put the first row at the top and preserve square pixels.
+            fig.update_yaxes(autorange="reversed", scaleanchor="x", scaleratio=1)
+            fig.update_xaxes(visible=False)
+            fig.update_yaxes(visible=False)
+            fig.show()
 
     for data, label in pretrain_loader:
         print(f"data: {data}, label: {label}")
