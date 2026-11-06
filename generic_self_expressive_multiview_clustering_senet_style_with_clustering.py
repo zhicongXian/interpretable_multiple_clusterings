@@ -2809,6 +2809,9 @@ def run(args: argparse.Namespace) -> None:
         cluster_history = []
         cluster_test_metrics = None
         if args.cluster_epochs > 0:
+            if weights.normalized_cut == 0:
+                print("manually setting normalized cut for the post training to 0.5")
+                weights.normalized_cut = 0.5
             cluster_history, optimizer = train_cluster_assignment_phase(
                 model, train_loader,
                 epochs=args.cluster_epochs,
